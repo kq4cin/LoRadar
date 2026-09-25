@@ -21,8 +21,20 @@ LoRadar/
 
 ## 1. Backend Server Setup
 
-Requirements: Python 3.9+. Optional: `pyserial` if using the direct USB
-serial transport (`pip install pyserial`).
+Requirements: Python 3.9+, and [`meshcore-cli`](https://github.com/meshcore-dev/meshcore-cli)
+installed and on your `PATH` (or point `meshcore_cli_path` in `config.json`
+at it):
+
+```bash
+pipx install meshcore-cli
+# or: pip install meshcore-cli
+```
+
+`server.py` never writes raw bytes to the node — stock MeshCore companion
+firmware only understands its own structured companion protocol, so all
+dispatch is done through `meshcore-cli`'s documented `chan <n> <msg>`
+command, which handles channel routing/encryption exactly like the
+companion app does.
 
 ```bash
 cd LoRadar
@@ -32,10 +44,22 @@ python server.py --setup
 The wizard will:
 1. Ask for your ZIP code / city or lat-lon.
 2. Auto-discover the nearest NEXRAD station via `api.weather.gov`.
-3. Ask you to choose a MeshCore connection method:
-   - **Serial** — direct USB write to your MeshCore companion-radio node's serial port.
-   - **CLI** — shell out to `meshcore-cli send --hex <payload>` (or any compatible CLI bridge).
-4. Save everything to `config.json`.
+3. Ask how `meshcore-cli` should reach your local companion-radio node:
+   **USB Serial**, **Bluetooth (BLE)**, or **TCP/WiFi bridge**.
+4. **Ask which MeshCore channel to broadcast on.** It will try to read your
+   node's existing channels automatically (`meshcore-cli get_channels`) and
+   let you pick one by name; otherwise you enter the channel number
+   manually. This is the same channel number shown in the MeshCore
+   companion app's Channels tab — e.g. if you created a channel named
+   `#LoRadar` as channel `2` in the app, enter `2` here so radar frames
+   route onto that channel instead of cluttering the default **Public
+   channel (0)**.
+5. Save everything to `config.json`.
+
+> **Tip:** Create a dedicated channel (e.g. `#LoRadar`) in the MeshCore
+> companion app on your base-station node *before* running `--setup`, so it
+> shows up in the auto-discovered channel list and other mesh users aren't
+> spammed with radar frames on Public chat.
 
 Run the broadcast loop:
 
@@ -59,7 +83,10 @@ python server.py --once   # send a single update cycle then exit
   cell count N (≤16), N × `[cell_index, dBZ]` pairs, CRC8.
 
 Both use the same CRC8 (poly `0x07`) implementation in `server.py` and
-`app.js`, verified to match byte-for-byte.
+`app.js`, verified to match byte-for-byte. Each frame is hex-encoded and
+sent as the text of a `meshcore-cli chan <channel> <hex>` message — the
+configured channel's key on stock firmware handles the actual mesh
+encryption/routing, so LoRadar itself never needs to know about that key.
 
 ## 2. Hardware
 
@@ -69,7 +96,11 @@ instructions. No custom code is required — the node exposes:
 - A **Nordic UART Service (NUS)** over BLE, or
 - A **USB serial passthrough**
 
-Either interface streams raw bytes end-to-end across the mesh to the PWA.
+Either interface streams data end-to-end across the mesh to the PWA.
+**Important:** the phone's companion node (the one running the PWA) must
+also have the same channel (e.g. `#LoRadar`) added in its own MeshCore app
+configuration — a node can only decrypt/forward messages for channels it
+has joined, same as any other MeshCore channel traffic.
 
 ## 3. PWA Client
 

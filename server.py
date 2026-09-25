@@ -5,21 +5,24 @@ Low-Bandwidth Off-Grid Weather Radar System — Backend Server
 
 Fetches NWS NEXRAD radar composite reflectivity data, downsamples it into a
 16x16 sparse dBZ matrix, packs it into compact binary frames (<35 bytes), and
-dispatches those frames to a local, stock-firmware MeshCore node over a
-serial (USB) connection so they can propagate across a LoRa mesh network to
-offline PWA clients.
+dispatches those frames onto a user-chosen MeshCore channel via the stock
+`meshcore-cli` tool so they propagate across a LoRa mesh network to offline
+PWA clients.
 
-No custom MeshCore firmware is required — this script only writes bytes to
-the node's serial port, which stock MeshCore firmware forwards as a raw
-"send" over the mesh (via the MeshCore companion-radio serial protocol) or,
-for the simplest possible integration, as a raw pass-through byte stream
-that a stock MeshCore repeater will flood to connected companion apps.
+No custom MeshCore firmware is required. Dispatch always goes through
+`meshcore-cli`'s documented `chan <n> <hex>` command (reaching the local
+companion-radio node over Serial, BLE, or TCP) rather than writing raw bytes
+directly to the node — stock companion firmware only understands its own
+structured protocol, and using `chan` ensures frames are routed/encrypted on
+the exact channel number you configured to match the MeshCore companion
+app (defaulting away from the shared Public channel so radar traffic
+doesn't clutter public chat for other mesh users).
 
 Usage:
     python server.py --setup            # interactive configuration wizard
     python server.py --run              # start the fetch/transmit loop
     python server.py --once             # fetch + send a single frame (debug)
-    python server.py --dump             # print the packed frame as hex, no serial write
+    python server.py --dump             # print the packed frame as hex, no dispatch
 
 Author: Generated for the LoRadar project.
 """
@@ -81,10 +84,22 @@ class Config:
     center_lon: float = 0.0
     span_miles: float = 50.0
     update_interval_sec: int = 300
+
+    # How `meshcore-cli` should connect to the local companion-radio node.
+    connection_mode: str = "serial"  # "serial" | "ble" | "tcp"
     serial_port: str = ""
     baud_rate: int = 115200
-    transport: str = "serial"  # "serial" or "cli"
+    ble_address: str = ""  # blank = let meshcore-cli auto-select the first paired device
+    tcp_host: str = ""
+    tcp_port: int = 5000
     meshcore_cli_path: str = "meshcore-cli"
+
+    # Which MeshCore channel to broadcast radar frames on. This MUST match a
+    # channel number already configured in the MeshCore companion app (e.g. a
+    # custom "#LoRadar" channel you created there). Channel 0 is always the
+    # default Public channel that ships with every stock node.
+    channel: int = 0
+    channel_name: str = "Public"
 
     @staticmethod
     def load(path: str = CONFIG_PATH) -> "Config":
@@ -344,65 +359,108 @@ def build_radar_frame(sparse: List[Tuple[int, int]]) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# Transport: serial dispatch to stock MeshCore node
+# Transport: dispatch to stock MeshCore node via meshcore-cli
 # ---------------------------------------------------------------------------
+#
+# Stock MeshCore companion-radio firmware only understands its own
+# structured companion protocol (BLE NUS / USB serial / TCP) — it does not
+# accept arbitrary raw bytes as a "channel broadcast". The officially
+# documented, stock-compatible way to inject data onto a specific channel is
+# the `meshcore-cli` tool's `chan <channel_number> <message>` command, which
+# speaks that protocol correctly and lets the node handle channel
+# encryption/routing exactly as the companion app would.
+#
+# We hex-encode our compact binary frame and send it as the channel message
+# text (`chan <nb> <hex>`), matching whatever channel number the user
+# configured in the MeshCore companion app (e.g. a dedicated "#LoRadar"
+# channel) so radar traffic never mixes into the default Public channel
+# unless the user explicitly chooses channel 0.
+
+def _connection_args(cfg: Config) -> List[str]:
+    """Build the meshcore-cli connection flags for the configured transport."""
+    if cfg.connection_mode == "serial":
+        if not cfg.serial_port:
+            raise RuntimeError("config.json serial_port is empty; run --setup again.")
+        args = ["-s", cfg.serial_port]
+        if cfg.baud_rate:
+            args += ["-b", str(cfg.baud_rate)]
+        return args
+    elif cfg.connection_mode == "ble":
+        return ["-a", cfg.ble_address] if cfg.ble_address else []
+    elif cfg.connection_mode == "tcp":
+        if not cfg.tcp_host:
+            raise RuntimeError("config.json tcp_host is empty; run --setup again.")
+        return ["-t", cfg.tcp_host, "-p", str(cfg.tcp_port or 5000)]
+    else:
+        raise ValueError(f"Unknown connection_mode: {cfg.connection_mode}")
+
 
 class MeshCoreTransport:
-    """Thin wrapper for sending raw binary frames to a stock MeshCore
-    companion-radio node. Two modes:
-
-      - "serial": Opens the node's USB serial port directly (via pyserial)
-        and writes the raw frame bytes prefixed with a simple length byte
-        so the receiving companion app / bridge can delimit frames. Stock
-        MeshCore companion firmware exposes a serial passthrough that will
-        flood arbitrary payloads sent via its "send raw" command; for
-        maximum compatibility we wrap bytes using MeshCore's documented
-        CLI text command instead when transport == "cli".
-
-      - "cli": Shells out to the `meshcore-cli` tool (or any compatible
-        CLI) using its `send` subcommand with a hex-encoded payload. This
-        avoids needing pyserial and works with any stock MeshCore
-        companion-radio CLI bridge.
+    """Sends frames to a stock MeshCore companion-radio node by shelling out
+    to `meshcore-cli`, targeting the user-configured channel number via the
+    `chan <nb> <hex>` command. Works identically regardless of whether the
+    local node is reached over Serial, BLE, or TCP.
     """
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self._serial = None
 
     def __enter__(self):
-        if self.cfg.transport == "serial":
-            try:
-                import serial  # type: ignore
-            except ImportError as exc:
-                raise RuntimeError(
-                    "pyserial is required for transport='serial'. Install with: pip install pyserial"
-                ) from exc
-            if not self.cfg.serial_port:
-                raise RuntimeError("config.json serial_port is empty; run --setup again.")
-            self._serial = serial.Serial(self.cfg.serial_port, self.cfg.baud_rate, timeout=2)
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        if self._serial is not None:
-            self._serial.close()
+        return False
 
     def send(self, frame: bytes) -> None:
-        if self.cfg.transport == "serial":
-            # Simple length-prefixed framing (1 byte length + payload) so the
-            # bridge/receiver can find frame boundaries over the raw UART
-            # stream. Adjust to match your specific MeshCore serial bridge
-            # if it expects a different delimiter.
-            packet = bytes([len(frame)]) + frame
-            self._serial.write(packet)
-            self._serial.flush()
-        elif self.cfg.transport == "cli":
-            import subprocess
+        import subprocess
 
-            hex_payload = frame.hex()
-            cmd = [self.cfg.meshcore_cli_path, "send", "--hex", hex_payload]
-            subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=15)
-        else:
-            raise ValueError(f"Unknown transport: {self.cfg.transport}")
+        hex_payload = frame.hex()
+        cmd = [self.cfg.meshcore_cli_path] + _connection_args(self.cfg) + [
+            "chan",
+            str(self.cfg.channel),
+            hex_payload,
+        ]
+        subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=20)
+
+
+def discover_channels(cfg: Config) -> Optional[List[Tuple[int, str]]]:
+    """Best-effort query of the connected node's configured channels via
+    `meshcore-cli -j ... get_channels`, used by the setup wizard to let the
+    user pick a channel by name instead of guessing its number. Returns None
+    if the node is unreachable or the output can't be parsed — callers
+    should fall back to manual channel number entry in that case."""
+    import subprocess
+
+    try:
+        cmd = [cfg.meshcore_cli_path, "-j"] + _connection_args(cfg) + ["get_channels"]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        data = json.loads(result.stdout)
+    except Exception:
+        return None
+
+    channels: List[Tuple[int, str]] = []
+    try:
+        if isinstance(data, list):
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                idx = item.get("channel_idx", item.get("idx", item.get("number", item.get("id"))))
+                name = item.get("name", item.get("channel_name", ""))
+                if idx is not None:
+                    channels.append((int(idx), str(name)))
+        elif isinstance(data, dict):
+            for key, val in data.items():
+                name = val.get("name", val.get("channel_name", "")) if isinstance(val, dict) else str(val)
+                try:
+                    channels.append((int(key), str(name)))
+                except (TypeError, ValueError):
+                    continue
+    except Exception:
+        return None
+
+    return channels or None
 
 
 def dispatch_frames(cfg: Config, frames: List[bytes]) -> None:
@@ -465,21 +523,82 @@ def run_setup_wizard() -> None:
     update_interval = int(prompt("Update interval (seconds)", str(cfg.update_interval_sec or 300)))
 
     print("\nStep 3: MeshCore Connection")
-    print("  1) Serial (USB) — direct pyserial write to companion-radio device")
-    print("  2) CLI bridge  — shell out to meshcore-cli 'send' command")
-    transport_choice = prompt("Choose transport", "1" if cfg.transport != "cli" else "2")
-    transport = "cli" if transport_choice.strip() == "2" else "serial"
+    print("  1) USB Serial — connect via cable to the companion-radio device")
+    print("  2) Bluetooth (BLE) — connect wirelessly via Nordic UART Service")
+    print("  3) TCP / WiFi bridge — connect via a network-attached MeshCore bridge")
+    conn_choice = prompt(
+        "Choose connection mode",
+        {"serial": "1", "ble": "2", "tcp": "3"}.get(cfg.connection_mode, "1"),
+    )
+    connection_mode = {"1": "serial", "2": "ble", "3": "tcp"}.get(conn_choice.strip(), "serial")
 
     serial_port = cfg.serial_port
     baud_rate = cfg.baud_rate
-    cli_path = cfg.meshcore_cli_path
+    ble_address = cfg.ble_address
+    tcp_host = cfg.tcp_host
+    tcp_port = cfg.tcp_port
+    cli_path = prompt("Path to meshcore-cli executable", cfg.meshcore_cli_path or "meshcore-cli")
 
-    if transport == "serial":
+    if connection_mode == "serial":
         default_port = cfg.serial_port or ("COM3" if os.name == "nt" else "/dev/ttyUSB0")
         serial_port = prompt("Serial port", default_port)
         baud_rate = int(prompt("Baud rate", str(cfg.baud_rate or 115200)))
+    elif connection_mode == "ble":
+        ble_address = prompt(
+            "BLE device name/address (leave blank to auto-select first paired device)",
+            cfg.ble_address,
+        )
+    else:  # tcp
+        tcp_host = prompt("TCP host/IP of MeshCore bridge", cfg.tcp_host or "192.168.1.50")
+        tcp_port = int(prompt("TCP port", str(cfg.tcp_port or 5000)))
+
+    partial_cfg = Config(
+        connection_mode=connection_mode,
+        serial_port=serial_port,
+        baud_rate=baud_rate,
+        ble_address=ble_address,
+        tcp_host=tcp_host,
+        tcp_port=tcp_port,
+        meshcore_cli_path=cli_path,
+    )
+
+    print("\nStep 4: Channel Selection")
+    print("Radar data should normally broadcast on a DEDICATED channel, not the")
+    print("default Public channel (0) — that keeps it from cluttering public chat")
+    print("for other mesh users. In the MeshCore companion app, create a channel")
+    print("(e.g. named '#LoRadar') under the Channels tab, note its channel")
+    print("number, then match it here.")
+
+    print("Attempting to read existing channels from the connected node...")
+    discovered = discover_channels(partial_cfg)
+    channel = cfg.channel
+    channel_name = cfg.channel_name
+
+    if discovered:
+        print("Found channels on node:")
+        for idx, name in sorted(discovered):
+            label = f"#{name}" if name and not name.startswith("#") else (name or "(unnamed)")
+            tag = "  <- Public/default" if idx == 0 else ""
+            print(f"  {idx}: {label}{tag}")
+        chan_input = prompt(
+            "Enter the channel number to broadcast on", str(cfg.channel or 0)
+        )
+        channel = int(chan_input)
+        match = next((n for i, n in discovered if i == channel), None)
+        channel_name = match if match else prompt("Channel name (for your reference)", channel_name or "")
     else:
-        cli_path = prompt("Path to meshcore-cli executable", cfg.meshcore_cli_path or "meshcore-cli")
+        print("  (Could not read channels automatically — node may be offline or")
+        print("   unreachable right now. Enter the channel number manually; you")
+        print("   can verify it later with: meshcore-cli get_channels)")
+        channel = int(prompt("Channel number to broadcast on (0 = Public)", str(cfg.channel or 0)))
+        channel_name = prompt(
+            "Channel name (for your reference only)",
+            channel_name or ("Public" if channel == 0 else ""),
+        )
+
+    if channel == 0:
+        print("  ! Warning: broadcasting on channel 0 (Public) will be visible to")
+        print("    every mesh user's chat client, not just LoRadar clients.")
 
     new_cfg = Config(
         station_id=station_id,
@@ -489,10 +608,15 @@ def run_setup_wizard() -> None:
         center_lon=round(lon, 4),
         span_miles=span_miles,
         update_interval_sec=update_interval,
+        connection_mode=connection_mode,
         serial_port=serial_port,
         baud_rate=baud_rate,
-        transport=transport,
+        ble_address=ble_address,
+        tcp_host=tcp_host,
+        tcp_port=tcp_port,
         meshcore_cli_path=cli_path,
+        channel=channel,
+        channel_name=channel_name,
     )
     new_cfg.save()
     print(f"\nSaved configuration to {CONFIG_PATH}")
@@ -513,7 +637,8 @@ def build_frames_for_cycle(cfg: Config) -> List[bytes]:
 
 def run_loop(cfg: Config) -> None:
     print(f"Starting LoRadar broadcast loop for {cfg.region_name} ({cfg.station_id})")
-    print(f"Transport: {cfg.transport}   Interval: {cfg.update_interval_sec}s")
+    chan_label = f"{cfg.channel} ({cfg.channel_name})" if cfg.channel_name else str(cfg.channel)
+    print(f"Connection: {cfg.connection_mode}   Channel: {chan_label}   Interval: {cfg.update_interval_sec}s")
     config_frame = build_config_frame(cfg)
     last_config_broadcast = 0.0
 
