@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+
+# Personal station configuration (contains location/coordinates) — generated
+# locally by `python server.py --setup`. Not committed by default.
+config.json
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db

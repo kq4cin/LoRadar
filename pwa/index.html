@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>LoRadar — Off-Grid Weather Radar</title>
+<meta name="theme-color" content="#0b1220" />
+<link rel="manifest" href="manifest.json" />
+<link rel="icon" href="icons/icon-192.png" />
+<link rel="apple-touch-icon" href="icons/icon-192.png" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+<style>
+  :root {
+    --bg: #0b1220;
+    --panel: #121b2e;
+    --accent: #29d3ff;
+    --accent2: #7cffb2;
+    --danger: #ff5470;
+    --text: #e7f0ff;
+    --muted: #8ea0c2;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%; width: 100%;
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    overflow: hidden;
+  }
+  #map { position: absolute; inset: 0; z-index: 0; background: #071019; }
+
+  #radarCanvas {
+    position: absolute; inset: 0; z-index: 400; pointer-events: none;
+  }
+
+  /* Top status bar */
+  #statusBar {
+    position: absolute; top: 0; left: 0; right: 0; z-index: 900;
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 12px; background: linear-gradient(180deg, rgba(8,14,26,0.92), rgba(8,14,26,0.55));
+    backdrop-filter: blur(6px);
+    font-size: 13px;
+  }
+  #statusBar .dot {
+    width: 10px; height: 10px; border-radius: 50%; background: var(--danger);
+    box-shadow: 0 0 8px var(--danger);
+    flex-shrink: 0;
+  }
+  #statusBar .dot.connected { background: var(--accent2); box-shadow: 0 0 8px var(--accent2); }
+  #statusBar .region { font-weight: 600; }
+  #statusBar .spacer { flex: 1; }
+  #statusBar button {
+    background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.15);
+    color: var(--text); border-radius: 6px; padding: 6px 10px; font-size: 12px;
+    cursor: pointer;
+  }
+  #statusBar button:active { transform: scale(0.96); }
+
+  /* Legend */
+  #legend {
+    position: absolute; bottom: 14px; left: 14px; z-index: 900;
+    background: rgba(8,14,26,0.85); border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 10px; padding: 8px 10px; font-size: 11px; color: var(--muted);
+    display: flex; align-items: center; gap: 6px;
+  }
+  #legend .swatch { width: 14px; height: 10px; border-radius: 2px; display: inline-block; }
+
+  #lastUpdate {
+    position: absolute; bottom: 14px; right: 14px; z-index: 900;
+    background: rgba(8,14,26,0.85); border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 10px; padding: 8px 12px; font-size: 11px; color: var(--muted);
+  }
+
+  /* Onboarding modal */
+  #onboarding {
+    position: fixed; inset: 0; z-index: 2000;
+    background: radial-gradient(1200px 800px at 50% 0%, #12203c, #060a13 70%);
+    display: flex; align-items: center; justify-content: center;
+    padding: 20px;
+  }
+  #onboarding.hidden { display: none; }
+  .wizardCard {
+    width: 100%; max-width: 480px; background: var(--panel);
+    border: 1px solid rgba(255,255,255,0.08); border-radius: 16px;
+    padding: 24px; box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+    max-height: 90vh; overflow-y: auto;
+  }
+  .wizardCard h1 {
+    font-size: 20px; margin: 0 0 4px; color: var(--accent);
+  }
+  .wizardCard .step-sub { color: var(--muted); font-size: 13px; margin-bottom: 18px; }
+  .wizardCard h2 { font-size: 16px; margin: 0 0 12px; }
+  .stepDots { display: flex; gap: 6px; margin-bottom: 18px; }
+  .stepDots span {
+    flex: 1; height: 4px; border-radius: 2px; background: rgba(255,255,255,0.1);
+  }
+  .stepDots span.active { background: var(--accent); }
+  .stepDots span.done { background: var(--accent2); }
+
+  .optionBtn {
+    display: block; width: 100%; text-align: left;
+    background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.12);
+    color: var(--text); padding: 14px; border-radius: 10px; margin-bottom: 10px;
+    cursor: pointer; font-size: 14px;
+  }
+  .optionBtn:hover { border-color: var(--accent); }
+  .optionBtn.selected { border-color: var(--accent2); background: rgba(124,255,178,0.08); }
+  .optionBtn small { display: block; color: var(--muted); margin-top: 3px; font-size: 12px; }
+
+  input[type="text"], input[type="number"] {
+    width: 100%; padding: 10px 12px; border-radius: 8px; margin-bottom: 10px;
+    background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.15);
+    color: var(--text); font-size: 14px;
+  }
+  label.fieldLabel { font-size: 12px; color: var(--muted); display:block; margin-bottom: 4px; }
+
+  .btnRow { display: flex; gap: 10px; margin-top: 18px; }
+  .btn {
+    flex: 1; padding: 12px; border-radius: 10px; border: none; font-size: 14px;
+    font-weight: 600; cursor: pointer;
+  }
+  .btn.primary { background: var(--accent); color: #002733; }
+  .btn.ghost { background: transparent; border: 1px solid rgba(255,255,255,0.2); color: var(--text); }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  progress { width: 100%; height: 10px; border-radius: 6px; overflow: hidden; margin: 10px 0; }
+  progress::-webkit-progress-bar { background: rgba(255,255,255,0.08); border-radius: 6px; }
+  progress::-webkit-progress-value { background: var(--accent2); border-radius: 6px; }
+  #tileProgressLabel { font-size: 12px; color: var(--muted); text-align: center; }
+
+  .hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
+
+  #toast {
+    position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+    background: rgba(20,28,46,0.95); border: 1px solid rgba(255,255,255,0.15);
+    color: var(--text); padding: 10px 16px; border-radius: 10px; font-size: 13px;
+    z-index: 3000; display: none; max-width: 90vw;
+  }
+
+  .gps-pulse-wrap { position: relative; width: 22px; height: 22px; }
+  .gps-pulse-core {
+    position: absolute; top: 50%; left: 50%; width: 14px; height: 14px;
+    margin: -7px 0 0 -7px; border-radius: 50%;
+    background: #2ea8ff; box-shadow: 0 0 0 2px white, 0 0 10px #2ea8ff;
+  }
+  .gps-pulse-ring {
+    position: absolute; top: 50%; left: 50%; width: 14px; height: 14px;
+    margin: -7px 0 0 -7px; border-radius: 50%; background: rgba(46,168,255,0.55);
+    animation: gpsPulse 1.8s ease-out infinite;
+  }
+  @keyframes gpsPulse {
+    0% { transform: scale(1); opacity: 0.8; }
+    100% { transform: scale(3.4); opacity: 0; }
+  }
+</style>
+</head>
+<body>
+
+<div id="map"></div>
+<canvas id="radarCanvas"></canvas>
+
+<div id="statusBar">
+  <div class="dot" id="connDot"></div>
+  <div class="region" id="regionLabel">No station configured</div>
+  <div class="spacer"></div>
+  <button id="reconnectBtn">Connect</button>
+  <button id="settingsBtn">⚙</button>
+</div>
+
+<div id="legend">
+  <span>dBZ:</span>
+  <span class="swatch" style="background:#3cff3c"></span><span>15-25</span>
+  <span class="swatch" style="background:#ffff3c"></span><span>25-40</span>
+  <span class="swatch" style="background:#ff9a3c"></span><span>40-55</span>
+  <span class="swatch" style="background:#ff3c3c"></span><span>55-65</span>
+  <span class="swatch" style="background:#d43cff"></span><span>65+</span>
+</div>
+
+<div id="lastUpdate">No radar data yet</div>
+
+<div id="toast"></div>
+
+<!-- Onboarding Wizard -->
+<div id="onboarding">
+  <div class="wizardCard">
+    <h1>LoRadar Setup</h1>
+    <div class="step-sub">Off-grid weather radar over LoRa mesh</div>
+    <div class="stepDots" id="stepDots">
+      <span data-step="1"></span><span data-step="2"></span><span data-step="3"></span><span data-step="4"></span>
+    </div>
+
+    <!-- Step 1: Transport -->
+    <div class="wizStep" id="step1">
+      <h2>Step 1 — Connect to MeshCore Node</h2>
+      <button class="optionBtn" data-transport="bluetooth">
+        WebBluetooth (BLE)
+        <small>Connect to a stock MeshCore companion-radio node via Nordic UART Service</small>
+      </button>
+      <button class="optionBtn" data-transport="serial">
+        WebSerial (USB)
+        <small>Connect via USB cable to a stock MeshCore node's serial port</small>
+      </button>
+      <div class="hint" id="transportSupportHint"></div>
+      <div class="btnRow">
+        <button class="btn primary" id="step1Next" disabled>Continue</button>
+      </div>
+    </div>
+
+    <!-- Step 2: Location -->
+    <div class="wizStep hidden" id="step2">
+      <h2>Step 2 — Your Location</h2>
+      <button class="optionBtn" id="useGpsBtn">
+        Use Phone GPS
+        <small>Recommended — enables live "You Are Here" tracking</small>
+      </button>
+      <button class="optionBtn" id="useManualBtn">
+        Enter Manually
+        <small>ZIP code or Latitude / Longitude</small>
+      </button>
+      <div id="manualLocationFields" class="hidden" style="margin-top:12px;">
+        <label class="fieldLabel">ZIP code or "City, State"</label>
+        <input type="text" id="zipInput" placeholder="e.g. 37201 or Nashville, TN" />
+        <label class="fieldLabel">— or — Latitude / Longitude</label>
+        <div style="display:flex; gap:8px;">
+          <input type="text" id="latInput" placeholder="Latitude" />
+          <input type="text" id="lonInput" placeholder="Longitude" />
+        </div>
+      </div>
+      <div class="hint" id="locationStatusHint"></div>
+      <div class="btnRow">
+        <button class="btn ghost" id="step2Back">Back</button>
+        <button class="btn primary" id="step2Next" disabled>Continue</button>
+      </div>
+    </div>
+
+    <!-- Step 3: Offline Map Download -->
+    <div class="wizStep hidden" id="step3">
+      <h2>Step 3 — Download Offline Map Tiles</h2>
+      <p class="hint">While you have internet access, LoRadar will cache map tiles
+      (zoom levels 8–11) around your location into on-device storage so the map still
+      renders when you're off-grid.</p>
+      <button class="btn primary" id="downloadTilesBtn" style="width:100%;">Download Tiles</button>
+      <progress id="tileProgress" value="0" max="100"></progress>
+      <div id="tileProgressLabel">0 / 0 tiles</div>
+      <div class="btnRow">
+        <button class="btn ghost" id="step3Back">Back</button>
+        <button class="btn primary" id="step3Next" disabled>Continue</button>
+      </div>
+      <div class="hint"><button class="btn ghost" id="skipTilesBtn" style="width:100%; margin-top:8px;">Skip (map may be blank offline)</button></div>
+    </div>
+
+    <!-- Step 4: Audio Test -->
+    <div class="wizStep hidden" id="step4">
+      <h2>Step 4 — Alert Sound Test</h2>
+      <p class="hint">LoRadar plays an audio alert when severe reflectivity (55+ dBZ)
+      is detected nearby. Test it now to confirm your device's speaker/volume works.</p>
+      <button class="btn primary" id="playTestSoundBtn" style="width:100%;">▶ Play Test Alert</button>
+      <div class="btnRow">
+        <button class="btn ghost" id="step4Back">Back</button>
+        <button class="btn primary" id="finishSetupBtn">Finish Setup</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+<script src="app.js"></script>
+</body>
+</html>
