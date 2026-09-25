@@ -105,7 +105,12 @@ has joined, same as any other MeshCore channel traffic.
 ## 3. PWA Client
 
 Serve the `pwa/` folder over HTTPS (or `localhost` for dev/testing) — both
-WebBluetooth and WebSerial require a secure context.
+WebBluetooth and WebSerial require a secure context. The app uses the
+official [`meshcore.js`](https://github.com/meshcore-dev/meshcore.js)
+library (loaded from a CDN at runtime, cached offline by the service
+worker) to speak the real MeshCore companion protocol — it does **not**
+treat the connection as a raw byte pipe, since stock firmware only
+understands its own structured command/response protocol.
 
 ```bash
 cd LoRadar/pwa
@@ -114,16 +119,24 @@ python -m http.server 8811
 ```
 
 On first run you'll see the **onboarding wizard**:
-1. **Transport** — pick WebBluetooth or WebSerial and pair with your MeshCore node.
-2. **Location** — use phone GPS or enter ZIP/lat-lon manually.
-3. **Offline tiles** — while online, downloads OSM tiles (zoom 8–11) around
+1. **Transport** — pick WebBluetooth or WebSerial; the app connects and
+   completes the MeshCore companion handshake before continuing.
+2. **Channel** — select which MeshCore channel to listen for radar frames
+   on. The wizard reads the connected node's existing channels
+   (`GetChannel`/`GetChannels`) and lets you pick one by name (e.g.
+   `#LoRadar`); if discovery fails, enter the channel number manually. This
+   must match the channel number configured in `server.py --setup`.
+3. **Location** — use phone GPS or enter ZIP/lat-lon manually.
+4. **Offline tiles** — while online, downloads OSM tiles (zoom 8–11) around
    your location into `IndexedDB` for offline map rendering.
-4. **Audio test** — confirms the severe-weather alert tone plays.
+5. **Audio test** — confirms the severe-weather alert tone plays.
 
 After setup, the app:
 - Renders the cached map (or falls back to live fetch when online).
-- Parses incoming `0xCF`/`0x10` binary frames from the mesh and overlays a
-  16×16 color-coded reflectivity grid on the map.
+- Listens for MeshCore channel text messages on the configured channel,
+  filters out anything on other channels (e.g. Public chat), hex-decodes
+  the message text, and parses `0xCF`/`0x10` binary frames (CRC8-validated)
+  to overlay a 16×16 color-coded reflectivity grid on the map.
 - Shows a pulsing blue "You Are Here" GPS marker.
 - Plays an audio alert when any cell reports ≥55 dBZ.
 

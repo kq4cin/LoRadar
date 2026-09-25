@@ -152,6 +152,19 @@
     0% { transform: scale(1); opacity: 0.8; }
     100% { transform: scale(3.4); opacity: 0; }
   }
+
+  .channelBtn {
+    display: flex; justify-content: space-between; align-items: center;
+    width: 100%; text-align: left;
+    background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.12);
+    color: var(--text); padding: 10px 12px; border-radius: 8px; margin-bottom: 8px;
+    cursor: pointer; font-size: 13px;
+  }
+  .channelBtn:hover { border-color: var(--accent); }
+  .channelBtn.selected { border-color: var(--accent2); background: rgba(124,255,178,0.08); }
+  .channelBtn .idx {
+    background: rgba(255,255,255,0.1); border-radius: 6px; padding: 2px 8px; font-size: 11px;
+  }
 </style>
 </head>
 <body>
@@ -186,7 +199,7 @@
     <h1>LoRadar Setup</h1>
     <div class="step-sub">Off-grid weather radar over LoRa mesh</div>
     <div class="stepDots" id="stepDots">
-      <span data-step="1"></span><span data-step="2"></span><span data-step="3"></span><span data-step="4"></span>
+      <span data-step="1"></span><span data-step="2"></span><span data-step="3"></span><span data-step="4"></span><span data-step="5"></span>
     </div>
 
     <!-- Step 1: Transport -->
@@ -201,14 +214,36 @@
         <small>Connect via USB cable to a stock MeshCore node's serial port</small>
       </button>
       <div class="hint" id="transportSupportHint"></div>
+      <div class="hint" id="connectStatusHint"></div>
       <div class="btnRow">
-        <button class="btn primary" id="step1Next" disabled>Continue</button>
+        <button class="btn primary" id="step1Next" disabled>Connect &amp; Continue</button>
       </div>
     </div>
 
-    <!-- Step 2: Location -->
+    <!-- Step 2: Channel Selection -->
     <div class="wizStep hidden" id="step2">
-      <h2>Step 2 — Your Location</h2>
+      <h2>Step 2 — Select MeshCore Channel</h2>
+      <p class="hint">Radar data broadcasts on a specific MeshCore channel — it should
+      match a channel you've already created in the MeshCore companion app (e.g. a
+      dedicated "#LoRadar" channel), <strong>not</strong> the default Public channel,
+      so it doesn't mix in with public chat.</p>
+      <div id="channelListContainer"></div>
+      <div class="hint" id="channelStatusHint">Reading channels from connected node...</div>
+      <div id="manualChannelFields" style="margin-top:12px;">
+        <label class="fieldLabel">Channel number (matches the MeshCore companion app)</label>
+        <input type="text" id="channelNumberInput" placeholder="e.g. 2" />
+        <label class="fieldLabel">Channel name (for your reference only)</label>
+        <input type="text" id="channelNameInput" placeholder="e.g. LoRadar" />
+      </div>
+      <div class="btnRow">
+        <button class="btn ghost" id="step2Back">Back</button>
+        <button class="btn primary" id="step2Next" disabled>Continue</button>
+      </div>
+    </div>
+
+    <!-- Step 3: Location -->
+    <div class="wizStep hidden" id="step3">
+      <h2>Step 3 — Your Location</h2>
       <button class="optionBtn" id="useGpsBtn">
         Use Phone GPS
         <small>Recommended — enables live "You Are Here" tracking</small>
@@ -228,14 +263,14 @@
       </div>
       <div class="hint" id="locationStatusHint"></div>
       <div class="btnRow">
-        <button class="btn ghost" id="step2Back">Back</button>
-        <button class="btn primary" id="step2Next" disabled>Continue</button>
+        <button class="btn ghost" id="step3Back">Back</button>
+        <button class="btn primary" id="step3Next" disabled>Continue</button>
       </div>
     </div>
 
-    <!-- Step 3: Offline Map Download -->
-    <div class="wizStep hidden" id="step3">
-      <h2>Step 3 — Download Offline Map Tiles</h2>
+    <!-- Step 4: Offline Map Download -->
+    <div class="wizStep hidden" id="step4">
+      <h2>Step 4 — Download Offline Map Tiles</h2>
       <p class="hint">While you have internet access, LoRadar will cache map tiles
       (zoom levels 8–11) around your location into on-device storage so the map still
       renders when you're off-grid.</p>
@@ -243,20 +278,20 @@
       <progress id="tileProgress" value="0" max="100"></progress>
       <div id="tileProgressLabel">0 / 0 tiles</div>
       <div class="btnRow">
-        <button class="btn ghost" id="step3Back">Back</button>
-        <button class="btn primary" id="step3Next" disabled>Continue</button>
+        <button class="btn ghost" id="step4Back">Back</button>
+        <button class="btn primary" id="step4Next" disabled>Continue</button>
       </div>
       <div class="hint"><button class="btn ghost" id="skipTilesBtn" style="width:100%; margin-top:8px;">Skip (map may be blank offline)</button></div>
     </div>
 
-    <!-- Step 4: Audio Test -->
-    <div class="wizStep hidden" id="step4">
-      <h2>Step 4 — Alert Sound Test</h2>
+    <!-- Step 5: Audio Test -->
+    <div class="wizStep hidden" id="step5">
+      <h2>Step 5 — Alert Sound Test</h2>
       <p class="hint">LoRadar plays an audio alert when severe reflectivity (55+ dBZ)
       is detected nearby. Test it now to confirm your device's speaker/volume works.</p>
       <button class="btn primary" id="playTestSoundBtn" style="width:100%;">▶ Play Test Alert</button>
       <div class="btnRow">
-        <button class="btn ghost" id="step4Back">Back</button>
+        <button class="btn ghost" id="step5Back">Back</button>
         <button class="btn primary" id="finishSetupBtn">Finish Setup</button>
       </div>
     </div>
@@ -265,6 +300,6 @@
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
         integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
-<script src="app.js"></script>
+<script type="module" src="app.js"></script>
 </body>
 </html>

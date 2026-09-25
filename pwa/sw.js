@@ -14,6 +14,7 @@ const APP_SHELL = [
   "./manifest.json",
   "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css",
   "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js",
+  "https://esm.sh/@liamcottle/meshcore.js@1.15.0",
   "./icons/icon-192.png",
   "./icons/icon-512.png",
 ];

@@ -3,14 +3,23 @@
    Off-grid weather radar renderer for MeshCore LoRa mesh networks.
    ==========================================================================
    Responsibilities:
-     - First-run onboarding wizard (transport, location, offline tiles, audio)
+     - First-run onboarding wizard (transport, channel, location, offline
+       tiles, audio)
      - IndexedDB-backed offline map tile cache + custom Leaflet TileLayer
-     - WebBluetooth (Nordic UART Service) and WebSerial transports for
-       reading raw binary frames from a stock MeshCore companion node
-     - Binary frame parsing: 0xCF (config) and 0x10 (sparse radar) frames
+     - Real MeshCore companion-radio protocol (via the official meshcore.js
+       library) over WebBluetooth (BLE/NUS) or WebSerial, listening for
+       channel text messages on a user-selected channel
+     - Binary frame parsing: 0xCF (config) and 0x10 (sparse radar) frames,
+       hex-decoded out of the channel message text sent by server.py
      - Canvas overlay rendering of the 16x16 reflectivity grid
      - Live GPS "You Are Here" pulsing marker
    ========================================================================== */
+
+import {
+  WebBleConnection,
+  WebSerialConnection,
+  Constants as MeshCoreConstants,
+} from "https://esm.sh/@liamcottle/meshcore.js@1.15.0";
 
 (() => {
   "use strict";
@@ -24,9 +33,6 @@
   const GRID_SIZE = 16;
   const FRAME_CONFIG = 0xcf;
   const FRAME_RADAR = 0x10;
-  const NUS_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
-  const NUS_TX_CHAR_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // notify (node -> browser)
-  const NUS_RX_CHAR_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; // write (browser -> node)
 
   const TILE_ZOOMS = [8, 9, 10, 11];
   const TILE_RADIUS_CELLS = 4; // tiles around center per zoom, in each direction
@@ -70,6 +76,18 @@
       }
     }
     return crc & 0xff;
+  }
+
+  function hexToBytes(hex) {
+    const clean = (hex || "").trim();
+    if (!clean || clean.length % 2 !== 0 || !/^[0-9a-fA-F]+$/.test(clean)) {
+      return null;
+    }
+    const bytes = new Uint8Array(clean.length / 2);
+    for (let i = 0; i < bytes.length; i++) {
+      bytes[i] = parseInt(clean.substr(i * 2, 2), 16);
+    }
+    return bytes;
   }
 
   // ------------------------------------------------------------------
@@ -233,11 +251,8 @@
     sparseCells: [], // [{cellIndex, dbz}]
     lastUpdateTs: null,
     transport: null, // "bluetooth" | "serial"
-    bleDevice: null,
-    bleChar: null,
-    serialPort: null,
-    serialReader: null,
-    rxBuffer: [],
+    channel: 0, // MeshCore channel index radar frames are expected on
+    mcConnection: null, // active meshcore.js Connection instance
     audioCtx: null,
     connected: false,
   };
@@ -456,6 +471,26 @@
   }
 
   // ------------------------------------------------------------------
+  // MeshCore channel text message -> LoRadar frame bridge
+  // ------------------------------------------------------------------
+  // server.py sends frames as hex-encoded text on a specific MeshCore
+  // channel via `meshcore-cli chan <n> <hex>`. We only accept messages on
+  // the channel the user configured in the wizard, then hex-decode and
+  // CRC8-validate the payload before treating it as a LoRadar frame — this
+  // guards against accidentally parsing unrelated human chat text on the
+  // same channel.
+  function handleChannelMessage(channelMessage) {
+    if (channelMessage.channelIdx !== state.channel) {
+      return; // not our configured LoRadar channel; ignore (e.g. Public chat)
+    }
+    const bytes = hexToBytes(channelMessage.text);
+    if (!bytes || bytes.length < 2) {
+      return; // not a hex-encoded LoRadar frame (probably a human chat message)
+    }
+    handleIncomingFrame(bytes);
+  }
+
+  // ------------------------------------------------------------------
   // Audio alert
   // ------------------------------------------------------------------
   function ensureAudioCtx() {
@@ -488,117 +523,126 @@
   }
 
   // ------------------------------------------------------------------
-  // Transports: WebBluetooth (NUS) + WebSerial
+  // Transport: real MeshCore companion protocol via meshcore.js
   // ------------------------------------------------------------------
+  // We use the official meshcore.js library (WebBleConnection /
+  // WebSerialConnection) instead of hand-parsing raw NUS/serial bytes,
+  // since stock MeshCore companion firmware speaks its own structured
+  // command/response protocol, not a raw byte pipe. This also gives us
+  // proper per-channel message delivery matching whatever channel the user
+  // configured in the wizard (see handleChannelMessage above).
   function setConnected(isConnected) {
     state.connected = isConnected;
     $("#connDot").classList.toggle("connected", isConnected);
     $("#reconnectBtn").textContent = isConnected ? "Disconnect" : "Connect";
   }
 
-  // Frames arrive as: [length_byte, ...frame_bytes] over the raw stream
-  // (matches server.py's simple length-prefixed serial framing). We buffer
-  // incoming bytes and slice out complete frames.
-  function feedBytes(newBytes) {
-    for (const b of newBytes) state.rxBuffer.push(b);
-
-    while (state.rxBuffer.length >= 1) {
-      const len = state.rxBuffer[0];
-      if (len === 0 || len > 64) {
-        // Not a valid length prefix — resync by dropping a byte.
-        state.rxBuffer.shift();
-        continue;
+  // Drains any messages queued on the node (contact msgs, channel msgs,
+  // channel data) via the companion protocol's sync-next-message command,
+  // routing channel text messages into handleChannelMessage. Called once
+  // right after connecting, and again whenever the node pushes a
+  // "message waiting" notification.
+  async function pumpMessages(connection) {
+    try {
+      const messages = await connection.getWaitingMessages();
+      for (const msg of messages) {
+        if (msg && msg.channelMessage) {
+          handleChannelMessage(msg.channelMessage);
+        }
+        // contactMessage / channelData results are outside LoRadar's scope
+        // (direct messages, binary datagrams) and are ignored here.
       }
-      if (state.rxBuffer.length < 1 + len) break; // wait for more data
-
-      const frame = state.rxBuffer.slice(1, 1 + len);
-      state.rxBuffer = state.rxBuffer.slice(1 + len);
-      handleIncomingFrame(frame);
+    } catch (e) {
+      console.warn("pumpMessages failed", e);
     }
+  }
+
+  async function wireConnection(connection) {
+    state.mcConnection = connection;
+
+    connection.on("disconnected", () => {
+      setConnected(false);
+      toast("MeshCore node disconnected.");
+    });
+
+    connection.on(MeshCoreConstants.PushCodes.MsgWaiting, () => pumpMessages(connection));
+  }
+
+  // Resolves once the node completes its "connected" handshake (or rejects
+  // on timeout), performing the one-time app-start handshake + initial
+  // message drain. Registered with `.on` (not `.once`) so it also re-runs
+  // correctly if the underlying transport reconnects later.
+  function waitForConnected(connection, timeoutMs = 15000) {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          reject(new Error("Timed out waiting for MeshCore node handshake"));
+        }
+      }, timeoutMs);
+
+      connection.on("connected", async () => {
+        clearTimeout(timer);
+        setConnected(true);
+        try {
+          await connection.getSelfInfo(8000); // required handshake (CMD_APP_START)
+        } catch (e) {
+          console.warn("getSelfInfo handshake failed/timed out", e);
+        }
+        pumpMessages(connection);
+        if (!settled) {
+          settled = true;
+          resolve();
+        }
+      });
+    });
   }
 
   async function connectBluetooth() {
     if (!navigator.bluetooth) {
       toast("WebBluetooth not supported in this browser.");
-      return;
+      return false;
     }
     try {
-      const device = await navigator.bluetooth.requestDevice({
-        filters: [{ services: [NUS_SERVICE_UUID] }],
-        optionalServices: [NUS_SERVICE_UUID],
-      });
-      state.bleDevice = device;
-      device.addEventListener("gattserverdisconnected", () => {
-        setConnected(false);
-        toast("MeshCore node disconnected.");
-      });
-
-      const server = await device.gatt.connect();
-      const service = await server.getPrimaryService(NUS_SERVICE_UUID);
-      const txChar = await service.getCharacteristic(NUS_TX_CHAR_UUID);
-      state.bleChar = txChar;
-
-      await txChar.startNotifications();
-      txChar.addEventListener("characteristicvaluechanged", (event) => {
-        const value = event.target.value; // DataView
-        const bytes = new Uint8Array(value.buffer);
-        feedBytes(bytes);
-      });
-
-      setConnected(true);
-      toast("Connected via WebBluetooth (NUS).");
+      const connection = await WebBleConnection.open();
+      if (!connection) return false;
+      await wireConnection(connection);
+      await waitForConnected(connection);
+      toast("Connected to MeshCore node via WebBluetooth.");
+      return true;
     } catch (err) {
       console.error(err);
       toast(`Bluetooth connect failed: ${err.message || err}`);
+      return false;
     }
   }
 
   async function connectSerial() {
     if (!navigator.serial) {
       toast("WebSerial not supported in this browser.");
-      return;
+      return false;
     }
     try {
-      const port = await navigator.serial.requestPort();
-      await port.open({ baudRate: 115200 });
-      state.serialPort = port;
-
-      setConnected(true);
-      toast("Connected via WebSerial (USB).");
-
-      const reader = port.readable.getReader();
-      state.serialReader = reader;
-
-      (async () => {
-        try {
-          while (true) {
-            const { value, done } = await reader.read();
-            if (done) break;
-            if (value) feedBytes(value);
-          }
-        } catch (e) {
-          console.warn("Serial read loop ended", e);
-        } finally {
-          setConnected(false);
-        }
-      })();
+      const connection = await WebSerialConnection.open();
+      if (!connection) return false;
+      await wireConnection(connection);
+      await waitForConnected(connection);
+      toast("Connected to MeshCore node via WebSerial.");
+      return true;
     } catch (err) {
       console.error(err);
       toast(`Serial connect failed: ${err.message || err}`);
+      return false;
     }
   }
 
   async function disconnectTransport() {
-    if (state.transport === "bluetooth" && state.bleDevice && state.bleDevice.gatt.connected) {
-      state.bleDevice.gatt.disconnect();
-    }
-    if (state.transport === "serial" && state.serialPort) {
+    if (state.mcConnection) {
       try {
-        if (state.serialReader) {
-          await state.serialReader.cancel();
-        }
-        await state.serialPort.close();
+        await state.mcConnection.close();
       } catch (e) { /* ignore */ }
+      state.mcConnection = null;
     }
     setConnected(false);
   }
@@ -606,8 +650,27 @@
   async function connectUsingSavedTransport() {
     const transport = loadLocal("loradar.transport");
     state.transport = transport;
-    if (transport === "bluetooth") await connectBluetooth();
-    else if (transport === "serial") await connectSerial();
+    if (transport === "bluetooth") return connectBluetooth();
+    if (transport === "serial") return connectSerial();
+    return false;
+  }
+
+  // Fetches configured channels from the connected node (used by the
+  // wizard's channel-selection step), racing against a timeout since the
+  // companion protocol has no built-in timeout for repeated GetChannel
+  // requests and a non-responding/older-firmware node would otherwise hang
+  // the wizard indefinitely.
+  async function discoverChannels(connection, timeoutMs = 6000) {
+    const timeout = new Promise((resolve) => setTimeout(() => resolve(null), timeoutMs));
+    try {
+      const result = await Promise.race([connection.getChannels(), timeout]);
+      if (!result) return null;
+      return result
+        .filter((ch) => ch && (ch.name || ch.channelIdx === 0))
+        .map((ch) => ({ idx: ch.channelIdx, name: ch.name || (ch.channelIdx === 0 ? "Public" : "") }));
+    } catch (e) {
+      return null;
+    }
   }
 
   // ------------------------------------------------------------------
@@ -616,6 +679,7 @@
   const Wizard = {
     currentStep: 1,
     chosenTransport: null,
+    chosenChannel: null, // {idx, name}
     chosenLocation: null,
 
     init() {
@@ -646,8 +710,61 @@
       });
     },
 
+    // Queries the connected node for existing channels and renders them as
+    // pickable buttons; falls back to manual number entry if discovery
+    // fails/times out (e.g. older firmware, node not responding).
+    async loadChannelOptions() {
+      const container = $("#channelListContainer");
+      const statusHint = $("#channelStatusHint");
+      const manualFields = $("#manualChannelFields");
+      container.innerHTML = "";
+      statusHint.textContent = "Reading channels from connected node...";
+
+      if (!state.mcConnection) {
+        statusHint.textContent = "Not connected to a node — enter the channel number manually.";
+        manualFields.classList.remove("hidden");
+        return;
+      }
+
+      const channels = await discoverChannels(state.mcConnection);
+      if (!channels || channels.length === 0) {
+        statusHint.textContent =
+          "Could not read channels automatically. Enter the channel number manually " +
+          "(matching what you configured in the MeshCore companion app).";
+        manualFields.classList.remove("hidden");
+        return;
+      }
+
+      statusHint.textContent = "Select the channel matching your MeshCore companion app:";
+      manualFields.classList.add("hidden");
+      channels.forEach(({ idx, name }) => {
+        const btn = document.createElement("button");
+        btn.className = "channelBtn";
+        btn.type = "button";
+        const label = name && name !== "Public" ? `#${name}` : (idx === 0 ? "Public (default)" : "(unnamed)");
+        btn.innerHTML = `<span>${label}</span><span class="idx">ch ${idx}</span>`;
+        btn.addEventListener("click", () => {
+          $all(".channelBtn").forEach((b) => b.classList.remove("selected"));
+          btn.classList.add("selected");
+          this.chosenChannel = { idx, name: name || (idx === 0 ? "Public" : "") };
+          $("#step2Next").disabled = false;
+        });
+        container.appendChild(btn);
+      });
+
+      // Still allow manual override even when discovery succeeds.
+      const manualToggle = document.createElement("button");
+      manualToggle.className = "btn ghost";
+      manualToggle.type = "button";
+      manualToggle.style.width = "100%";
+      manualToggle.style.marginTop = "8px";
+      manualToggle.textContent = "Enter channel number manually instead";
+      manualToggle.addEventListener("click", () => manualFields.classList.remove("hidden"));
+      container.appendChild(manualToggle);
+    },
+
     bindEvents() {
-      // Step 1: transport selection
+      // Step 1: transport selection + connect
       $all("#step1 .optionBtn").forEach((btn) => {
         btn.addEventListener("click", () => {
           $all("#step1 .optionBtn").forEach((b) => b.classList.remove("selected"));
@@ -657,16 +774,44 @@
         });
       });
       $("#step1Next").addEventListener("click", async () => {
+        const btn = $("#step1Next");
+        const statusHint = $("#connectStatusHint");
+        btn.disabled = true;
+        statusHint.textContent = "Connecting to MeshCore node...";
         saveLocal("loradar.transport", this.chosenTransport);
         state.transport = this.chosenTransport;
-        if (this.chosenTransport === "bluetooth") await connectBluetooth();
-        else await connectSerial();
+
+        const ok = this.chosenTransport === "bluetooth" ? await connectBluetooth() : await connectSerial();
+        btn.disabled = false;
+        if (!ok) {
+          statusHint.textContent = "Connection failed — check your device and try again.";
+          return;
+        }
+        statusHint.textContent = "";
         this.showStep(2);
+        this.loadChannelOptions();
       });
 
-      // Step 2: location
+      // Step 2: channel selection
+      $("#step2Back").addEventListener("click", () => this.showStep(1));
+      $("#step2Next").addEventListener("click", () => {
+        if (!this.chosenChannel) {
+          const idx = parseInt($("#channelNumberInput").value, 10);
+          if (isNaN(idx) || idx < 0 || idx > 7) {
+            toast("Enter a valid channel number (0-7).");
+            return;
+          }
+          const name = $("#channelNameInput").value.trim();
+          this.chosenChannel = { idx, name: name || (idx === 0 ? "Public" : "") };
+        }
+        state.channel = this.chosenChannel.idx;
+        saveLocal("loradar.channel", this.chosenChannel);
+        this.showStep(3);
+      });
+
+      // Step 3: location
       $("#useGpsBtn").addEventListener("click", () => {
-        $all("#step2 .optionBtn").forEach((b) => b.classList.remove("selected"));
+        $all("#step3 .optionBtn").forEach((b) => b.classList.remove("selected"));
         $("#useGpsBtn").classList.add("selected");
         $("#manualLocationFields").classList.add("hidden");
         $("#locationStatusHint").textContent = "Requesting GPS permission...";
@@ -675,7 +820,7 @@
           (pos) => {
             this.chosenLocation = { lat: pos.coords.latitude, lon: pos.coords.longitude, source: "gps" };
             $("#locationStatusHint").textContent = `Located: ${this.chosenLocation.lat.toFixed(4)}, ${this.chosenLocation.lon.toFixed(4)}`;
-            $("#step2Next").disabled = false;
+            $("#step3Next").disabled = false;
           },
           (err) => {
             $("#locationStatusHint").textContent = `GPS failed: ${err.message}. Try manual entry.`;
@@ -685,14 +830,14 @@
       });
 
       $("#useManualBtn").addEventListener("click", () => {
-        $all("#step2 .optionBtn").forEach((b) => b.classList.remove("selected"));
+        $all("#step3 .optionBtn").forEach((b) => b.classList.remove("selected"));
         $("#useManualBtn").classList.add("selected");
         $("#manualLocationFields").classList.remove("hidden");
-        $("#step2Next").disabled = false;
+        $("#step3Next").disabled = false;
       });
 
-      $("#step2Back").addEventListener("click", () => this.showStep(1));
-      $("#step2Next").addEventListener("click", async () => {
+      $("#step3Back").addEventListener("click", () => this.showStep(2));
+      $("#step3Next").addEventListener("click", async () => {
         if (!this.chosenLocation) {
           const lat = parseFloat($("#latInput").value);
           const lon = parseFloat($("#lonInput").value);
@@ -723,10 +868,10 @@
           }
         }
         saveLocal("loradar.lastLocation", this.chosenLocation);
-        this.showStep(3);
+        this.showStep(4);
       });
 
-      // Step 3: tile download
+      // Step 4: tile download
       $("#downloadTilesBtn").addEventListener("click", async () => {
         const loc = this.chosenLocation || loadLocal("loradar.lastLocation");
         if (!loc) { toast("No location set."); return; }
@@ -738,20 +883,20 @@
             $("#tileProgressLabel").textContent = `${done} / ${total} tiles`;
           });
           toast("Offline tiles downloaded.");
-          $("#step3Next").disabled = false;
+          $("#step4Next").disabled = false;
         } catch (e) {
           toast(`Tile download error: ${e.message}`);
         } finally {
           $("#downloadTilesBtn").disabled = false;
         }
       });
-      $("#skipTilesBtn").addEventListener("click", () => this.showStep(4));
-      $("#step3Back").addEventListener("click", () => this.showStep(2));
-      $("#step3Next").addEventListener("click", () => this.showStep(4));
-
-      // Step 4: audio test + finish
-      $("#playTestSoundBtn").addEventListener("click", () => playAlertTone());
+      $("#skipTilesBtn").addEventListener("click", () => this.showStep(5));
       $("#step4Back").addEventListener("click", () => this.showStep(3));
+      $("#step4Next").addEventListener("click", () => this.showStep(5));
+
+      // Step 5: audio test + finish
+      $("#playTestSoundBtn").addEventListener("click", () => playAlertTone());
+      $("#step5Back").addEventListener("click", () => this.showStep(4));
       $("#finishSetupBtn").addEventListener("click", () => this.finish());
     },
 
@@ -768,12 +913,18 @@
   function bootMainApp() {
     const savedLocation = loadLocal("loradar.lastLocation");
     const savedConfig = loadLocal("loradar.stationConfig");
+    const savedChannel = loadLocal("loradar.channel", { idx: 0, name: "Public" });
     const lat = savedLocation ? savedLocation.lat : 36.16;
     const lon = savedLocation ? savedLocation.lon : -86.78;
+
+    state.channel = savedChannel.idx;
 
     if (savedConfig) {
       state.stationConfig = savedConfig;
       $("#regionLabel").textContent = `${savedConfig.stationId || "Unknown"} · cached config`;
+    } else {
+      const chLabel = savedChannel.name && savedChannel.name !== "Public" ? `#${savedChannel.name}` : "Public";
+      $("#regionLabel").textContent = `Listening on channel ${savedChannel.idx} (${chLabel})`;
     }
 
     initMap(lat, lon);
