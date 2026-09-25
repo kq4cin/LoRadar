@@ -4,7 +4,7 @@ Low-Bandwidth Off-Grid Weather Radar System — Backend Server
 ==============================================================
 
 Fetches NWS NEXRAD radar composite reflectivity data, downsamples it into a
-16x16 sparse dBZ matrix, packs it into compact binary frames (<35 bytes), and
+16x16 sparse dBZ matrix, packs it into compact binary frames (<=36 bytes), and
 dispatches those frames onto a user-chosen MeshCore channel via the stock
 `meshcore-cli` tool so they propagate across a LoRa mesh network to offline
 PWA clients.
@@ -332,7 +332,8 @@ def build_config_frame(cfg: Config) -> bytes:
 
 def build_radar_frame(sparse: List[Tuple[int, int]]) -> bytes:
     """
-    0x10 Sparse Radar Data Frame — up to 35 bytes total:
+    0x10 Sparse Radar Data Frame — up to 36 bytes total (3 fixed header
+    bytes + up to 16 * 2-byte cell tuples + 1 CRC8 byte):
 
       Byte 0        : 0x10 header
       Byte 1        : Sequence number (0-255, wraps)
@@ -354,7 +355,7 @@ def build_radar_frame(sparse: List[Tuple[int, int]]) -> bytes:
 
     total_len = 3 + 2 * n + 1
     assert len(body) == total_len
-    assert len(body) <= 35, f"radar frame exceeds 35 bytes budget: {len(body)}"
+    assert len(body) <= 36, f"radar frame exceeds 36 byte budget: {len(body)}"
     return bytes(body)
 
 

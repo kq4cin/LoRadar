@@ -1,6 +1,6 @@
 # LoRadar — Low-Bandwidth Off-Grid Weather Radar System
 
-Captures NWS radar data, compresses it into tiny binary packets (<35 bytes),
+Captures NWS radar data, compresses it into tiny binary packets (≤36 bytes),
 transmits it across a **stock MeshCore LoRa mesh network** (no custom
 firmware), and displays it on an offline-first PWA with cached map tiles and
 live GPS tracking.
@@ -79,14 +79,28 @@ python server.py --once   # send a single update cycle then exit
 - **`0xCF` Config Frame (12 bytes)**: station ID, center lat/lon (scaled
   int16), cell scale (mi/cell), region hash, CRC8. Broadcast occasionally so
   late-joining clients auto-configure.
-- **`0x10` Sparse Radar Frame (≤35 bytes)**: header, sequence number, active
-  cell count N (≤16), N × `[cell_index, dBZ]` pairs, CRC8.
+- **`0x10` Sparse Radar Frame (≤36 bytes)**: header, sequence number, active
+  cell count N (≤16), N × `[cell_index, dBZ]` pairs, CRC8. Worst case
+  (N=16) is exactly 3 + 2×16 + 1 = 36 bytes.
 
 Both use the same CRC8 (poly `0x07`) implementation in `server.py` and
-`app.js`, verified to match byte-for-byte. Each frame is hex-encoded and
-sent as the text of a `meshcore-cli chan <channel> <hex>` message — the
-configured channel's key on stock firmware handles the actual mesh
-encryption/routing, so LoRadar itself never needs to know about that key.
+`app.js`, verified to match byte-for-byte. Each frame is hex-encoded (36
+bytes → 72 hex characters worst case) and sent as the text of a
+`meshcore-cli chan <channel> <hex>` message — the configured channel's key
+on stock firmware handles the actual mesh encryption/routing, so LoRadar
+itself never needs to know about that key.
+
+**Does it fit in a standard MeshCore message?** Yes, comfortably. Stock
+companion firmware caps channel/direct text messages at `MAX_TEXT_LEN` = 160
+bytes (`10 × CIPHER_BLOCK_SIZE`), which in turn was sized to fit inside the
+radio's `MAX_PACKET_PAYLOAD` = 184-byte LoRa packet. However, firmware
+(`BaseChatMesh::sendGroupMessage`) always prepends `"<node name>: "` to
+every channel message before sending — this is baked into stock firmware,
+not something LoRadar controls. Node names are capped at 31 characters, so
+worst case the wire text is `72 (hex) + 31 (name) + 2 (": ")` = 105 bytes,
+still well under the 160-byte ceiling with ~55 bytes of margin. The PWA
+strips this sender-name prefix (by extracting the trailing hex run from the
+message text) before hex-decoding and CRC8-validating the payload.
 
 ## 2. Hardware
 

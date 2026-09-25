@@ -475,17 +475,30 @@ import {
   // ------------------------------------------------------------------
   // server.py sends frames as hex-encoded text on a specific MeshCore
   // channel via `meshcore-cli chan <n> <hex>`. We only accept messages on
-  // the channel the user configured in the wizard, then hex-decode and
-  // CRC8-validate the payload before treating it as a LoRadar frame — this
-  // guards against accidentally parsing unrelated human chat text on the
-  // same channel.
+  // the channel the user configured in the wizard.
+  //
+  // IMPORTANT: stock MeshCore companion firmware (BaseChatMesh::sendGroupMessage)
+  // always prepends "<sender node name>: " to the text of every channel
+  // message it sends — this is baked into the firmware, not something
+  // server.py can disable. So the text we receive looks like
+  // "MyBaseNode: cf4b4f4858..." rather than a bare hex string. We extract
+  // the trailing run of hex characters (the sender-name prefix always ends
+  // in a non-hex ": " separator) before hex-decoding, then CRC8-validate
+  // the result — this also guards against accidentally parsing unrelated
+  // human chat text on the same channel.
+  const TRAILING_HEX_RUN = /[0-9a-fA-F]+$/;
+
   function handleChannelMessage(channelMessage) {
     if (channelMessage.channelIdx !== state.channel) {
       return; // not our configured LoRadar channel; ignore (e.g. Public chat)
     }
-    const bytes = hexToBytes(channelMessage.text);
+    const match = (channelMessage.text || "").match(TRAILING_HEX_RUN);
+    if (!match) {
+      return; // no hex payload found (probably a human chat message)
+    }
+    const bytes = hexToBytes(match[0]);
     if (!bytes || bytes.length < 2) {
-      return; // not a hex-encoded LoRadar frame (probably a human chat message)
+      return; // not a valid hex-encoded LoRadar frame
     }
     handleIncomingFrame(bytes);
   }
