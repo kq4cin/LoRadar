@@ -669,6 +669,42 @@ import {
     return false;
   }
 
+  function normalizeChannelEntry(rawIdx, rawName = "") {
+    const idx = Number.parseInt(rawIdx, 10);
+    if (!Number.isInteger(idx) || idx < 0 || idx > MAX_CHANNEL_INDEX) return null;
+    const name = rawName == null ? "" : String(rawName).trim();
+    return { idx, name: name || (idx === 0 ? "Public" : "") };
+  }
+
+  function normalizeDiscoveredChannels(result) {
+    const channels = [];
+
+    if (Array.isArray(result)) {
+      result.forEach((item) => {
+        if (!item || typeof item !== "object") return;
+        const normalized = normalizeChannelEntry(
+          item.channelIdx ?? item.channel_idx ?? item.idx ?? item.number ?? item.id,
+          item.name ?? item.channel_name ?? item.channelName ?? ""
+        );
+        if (normalized) channels.push(normalized);
+      });
+    } else if (result && typeof result === "object") {
+      Object.entries(result).forEach(([key, val]) => {
+        const normalized = normalizeChannelEntry(
+          key,
+          val && typeof val === "object"
+            ? (val.name ?? val.channel_name ?? val.channelName ?? "")
+            : val
+        );
+        if (normalized) channels.push(normalized);
+      });
+    }
+
+    return channels
+      .sort((a, b) => a.idx - b.idx)
+      .filter((channel, index, arr) => index === 0 || arr[index - 1].idx !== channel.idx);
+  }
+
   // Fetches configured channels from the connected node (used by the
   // wizard's channel-selection step), racing against a timeout since the
   // companion protocol has no built-in timeout for repeated GetChannel
@@ -682,10 +718,7 @@ import {
     try {
       const result = await Promise.race([connection.getChannels(), timeout]);
       if (!result) return null;
-      return result
-        .filter((ch) => ch && Number.isInteger(ch.channelIdx) && ch.channelIdx >= 0 && ch.channelIdx <= MAX_CHANNEL_INDEX)
-        .sort((a, b) => a.channelIdx - b.channelIdx)
-        .map((ch) => ({ idx: ch.channelIdx, name: ch.name || (ch.channelIdx === 0 ? "Public" : "") }));
+      return normalizeDiscoveredChannels(result);
     } catch (e) {
       return null;
     }
