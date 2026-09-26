@@ -33,6 +33,7 @@ import {
   const GRID_SIZE = 16;
   const FRAME_CONFIG = 0xcf;
   const FRAME_RADAR = 0x10;
+  const MAX_CHANNEL_INDEX = 7;
 
   const TILE_ZOOMS = [8, 9, 10, 11];
   const TILE_RADIUS_CELLS = 4; // tiles around center per zoom, in each direction
@@ -673,13 +674,17 @@ import {
   // companion protocol has no built-in timeout for repeated GetChannel
   // requests and a non-responding/older-firmware node would otherwise hang
   // the wizard indefinitely.
-  async function discoverChannels(connection, timeoutMs = 6000) {
+  async function discoverChannels(
+    connection,
+    timeoutMs = state.transport === "bluetooth" ? 20000 : 8000
+  ) {
     const timeout = new Promise((resolve) => setTimeout(() => resolve(null), timeoutMs));
     try {
       const result = await Promise.race([connection.getChannels(), timeout]);
       if (!result) return null;
       return result
-        .filter((ch) => ch && (ch.name || ch.channelIdx === 0))
+        .filter((ch) => ch && Number.isInteger(ch.channelIdx) && ch.channelIdx >= 0 && ch.channelIdx <= MAX_CHANNEL_INDEX)
+        .sort((a, b) => a.channelIdx - b.channelIdx)
         .map((ch) => ({ idx: ch.channelIdx, name: ch.name || (ch.channelIdx === 0 ? "Public" : "") }));
     } catch (e) {
       return null;
@@ -731,7 +736,9 @@ import {
       const statusHint = $("#channelStatusHint");
       const manualFields = $("#manualChannelFields");
       container.innerHTML = "";
-      statusHint.textContent = "Reading channels from connected node...";
+      statusHint.textContent = state.transport === "bluetooth"
+        ? "Reading channels from connected node (BLE discovery can take several seconds)..."
+        : "Reading channels from connected node...";
 
       if (!state.mcConnection) {
         statusHint.textContent = "Not connected to a node — enter the channel number manually.";
