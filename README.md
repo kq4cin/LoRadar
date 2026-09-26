@@ -112,9 +112,10 @@ instructions. No custom code is required — the node exposes:
 
 Either interface streams data end-to-end across the mesh to the PWA.
 **Important:** the phone's companion node (the one running the PWA) must
-also have the same channel (e.g. `#LoRadar`) added in its own MeshCore app
-configuration — a node can only decrypt/forward messages for channels it
-has joined, same as any other MeshCore channel traffic.
+also have the same channel (e.g. `#LoRadar`) on it — a node can only
+decrypt/forward messages for channels it has joined, same as any other
+MeshCore channel traffic. You can add it in the MeshCore app, or let the
+PWA's setup wizard join/create the #channel for you (see below).
 
 ## 3. PWA Client
 
@@ -136,16 +137,27 @@ On first run you'll see the **onboarding wizard**:
 1. **Transport** — pick WebBluetooth or WebSerial; the app connects and
    completes the MeshCore companion handshake before continuing.
 2. **Channel** — select which MeshCore channel to listen for radar frames
-   on. The wizard reads the connected node's existing channels
-   (`GetChannel`/`GetChannels`) and lets you pick one by name (e.g.
-   `#LoRadar`); if discovery fails, enter the channel number manually. This
-   must match the channel number configured in `server.py --setup`.
+   on. The wizard reads every channel slot on the connected node (sized
+   from the firmware's reported `MAX_GROUP_CHANNELS`, with per-request
+   timeouts) and lets you pick one by name (e.g. `#LoRadar`). You can also
+   type a **#channel name to join or create it** on the node: hashtag
+   channel keys are derived from the name (`SHA-256("#name")[0:16]`, the
+   same scheme the MeshCore apps and `meshcore-cli add_channel #name` use),
+   so if the channel already exists it's simply selected, otherwise it's
+   written into the first free slot. The name is case-sensitive and must
+   match the base station's channel exactly. If discovery fails, enter the
+   channel number manually. Slot numbers are local to each node — the
+   phone's `#LoRadar` doesn't need the same number as the base station's,
+   only the same name/key.
 3. **Location** — use phone GPS or enter ZIP/lat-lon manually.
 4. **Offline tiles** — while online, downloads OSM tiles (zoom 8–11) around
    your location into `IndexedDB` for offline map rendering.
 5. **Audio test** — confirms the severe-weather alert tone plays.
 
 After setup, the app:
+- Re-checks the saved channel on every connect: if it moved to another
+  slot (e.g. you deleted/reordered channels in the MeshCore app) it follows
+  it by key, and a missing #channel is re-added automatically.
 - Renders the cached map (or falls back to live fetch when online).
 - Listens for MeshCore channel text messages on the configured channel,
   filters out anything on other channels (e.g. Public chat), hex-decodes

@@ -33,7 +33,6 @@ import {
   const GRID_SIZE = 16;
   const FRAME_CONFIG = 0xcf;
   const FRAME_RADAR = 0x10;
-  const MAX_CHANNEL_INDEX = 7;
 
   const TILE_ZOOMS = [8, 9, 10, 11];
   const TILE_RADIUS_CELLS = 4; // tiles around center per zoom, in each direction
@@ -551,24 +550,53 @@ import {
     $("#reconnectBtn").textContent = isConnected ? "Disconnect" : "Connect";
   }
 
+  const RC = MeshCoreConstants.ResponseCodes;
+
+  // The companion protocol has no request IDs: replies (ChannelInfo, Ok, Err,
+  // ...) are matched to requests purely by arrival order. Running two
+  // command sequences at once (e.g. the message pump and channel discovery)
+  // lets one steal the other's replies, so every command sequence we issue
+  // goes through this single-flight queue.
+  let radioQueue = Promise.resolve();
+  function withRadio(fn) {
+    const run = radioQueue.then(fn, fn);
+    radioQueue = run.catch(() => {});
+    return run;
+  }
+
+  function withTimeout(promise, ms, label) {
+    let timer;
+    return Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out`)), ms);
+      }),
+    ]).finally(() => clearTimeout(timer));
+  }
+
   // Drains any messages queued on the node (contact msgs, channel msgs,
   // channel data) via the companion protocol's sync-next-message command,
   // routing channel text messages into handleChannelMessage. Called once
   // right after connecting, and again whenever the node pushes a
   // "message waiting" notification.
-  async function pumpMessages(connection) {
-    try {
-      const messages = await connection.getWaitingMessages();
-      for (const msg of messages) {
-        if (msg && msg.channelMessage) {
-          handleChannelMessage(msg.channelMessage);
+  let pumpPending = false;
+  function pumpMessages(connection) {
+    if (pumpPending) return; // a queued pump will pick up the new message too
+    pumpPending = true;
+    return withRadio(async () => {
+      pumpPending = false;
+      try {
+        for (let i = 0; i < 256; i++) {
+          const msg = await withTimeout(connection.syncNextMessage(), 5000, "SyncNextMessage");
+          if (!msg) break;
+          if (msg.channelMessage) handleChannelMessage(msg.channelMessage);
+          // contactMessage / channelData results are outside LoRadar's scope
+          // (direct messages, binary datagrams) and are ignored here.
         }
-        // contactMessage / channelData results are outside LoRadar's scope
-        // (direct messages, binary datagrams) and are ignored here.
+      } catch (e) {
+        console.warn("pumpMessages failed", e);
       }
-    } catch (e) {
-      console.warn("pumpMessages failed", e);
-    }
+    });
   }
 
   async function wireConnection(connection) {
@@ -599,11 +627,13 @@ import {
       connection.on("connected", async () => {
         clearTimeout(timer);
         setConnected(true);
-        try {
-          await connection.getSelfInfo(8000); // required handshake (CMD_APP_START)
-        } catch (e) {
-          console.warn("getSelfInfo handshake failed/timed out", e);
-        }
+        await withRadio(async () => {
+          try {
+            await connection.getSelfInfo(8000); // required handshake (CMD_APP_START)
+          } catch (e) {
+            console.warn("getSelfInfo handshake failed/timed out", e);
+          }
+        });
         pumpMessages(connection);
         if (!settled) {
           settled = true;
@@ -664,63 +694,219 @@ import {
   async function connectUsingSavedTransport() {
     const transport = loadLocal("loradar.transport");
     state.transport = transport;
-    if (transport === "bluetooth") return connectBluetooth();
-    if (transport === "serial") return connectSerial();
-    return false;
+    let ok = false;
+    if (transport === "bluetooth") ok = await connectBluetooth();
+    else if (transport === "serial") ok = await connectSerial();
+    if (ok) verifySavedChannel(state.mcConnection);
+    return ok;
   }
 
-  function normalizeChannelEntry(rawIdx, rawName = "") {
-    const idx = Number.parseInt(rawIdx, 10);
-    if (!Number.isInteger(idx) || idx < 0 || idx > MAX_CHANNEL_INDEX) return null;
-    const name = rawName == null ? "" : String(rawName).trim();
-    return { idx, name: name || (idx === 0 ? "Public" : "") };
+  // ------------------------------------------------------------------
+  // MeshCore channel discovery / creation
+  // ------------------------------------------------------------------
+  // We talk to the channel commands directly instead of using meshcore.js's
+  // getChannels(): that helper walks every slot until the node returns an
+  // error, but current firmware answers for *every* slot up to
+  // MAX_GROUP_CHANNELS (often 40) even when empty, it has no per-request
+  // timeout, and its once()/off() pairing leaks Err listeners — which made
+  // discovery routinely blow past our old 6s cap and report "no channels".
+  const MAX_PROBE_CHANNELS = 64;
+  const CHANNEL_NAME_MAX_BYTES = 31; // 32-byte field incl. NUL terminator
+
+  function bytesToHex(bytes) {
+    return Array.from(bytes || [], (b) => b.toString(16).padStart(2, "0")).join("");
   }
 
-  function normalizeDiscoveredChannels(result) {
-    const channels = [];
+  function isZeroBytes(bytes) {
+    return !bytes || Array.prototype.every.call(bytes, (b) => b === 0);
+  }
 
-    if (Array.isArray(result)) {
-      result.forEach((item) => {
-        if (!item || typeof item !== "object") return;
-        const normalized = normalizeChannelEntry(
-          item.channelIdx ?? item.channel_idx ?? item.idx ?? item.number ?? item.id,
-          item.name ?? item.channel_name ?? item.channelName ?? ""
-        );
-        if (normalized) channels.push(normalized);
-      });
-    } else if (result && typeof result === "object") {
-      Object.entries(result).forEach(([key, val]) => {
-        const normalized = normalizeChannelEntry(
-          key,
-          val && typeof val === "object"
-            ? (val.name ?? val.channel_name ?? val.channelName ?? "")
-            : val
-        );
-        if (normalized) channels.push(normalized);
-      });
+  // Sends one command and resolves with the first matching reply event.
+  // Resolves null on Err (e.g. ERR_CODE_NOT_FOUND), rejects on timeout.
+  function radioRequest(connection, send, successCode, timeoutMs, accept = () => true) {
+    return new Promise((resolve, reject) => {
+      const cleanup = () => {
+        clearTimeout(timer);
+        connection.off(successCode, onSuccess);
+        connection.off(RC.Err, onErr);
+      };
+      const onSuccess = (resp) => {
+        if (!accept(resp)) return;
+        cleanup();
+        resolve(resp || {});
+      };
+      const onErr = () => { cleanup(); resolve(null); };
+      const timer = setTimeout(() => { cleanup(); reject(new Error("Node did not respond")); }, timeoutMs);
+      connection.on(successCode, onSuccess);
+      connection.on(RC.Err, onErr);
+      Promise.resolve(send()).catch((e) => { cleanup(); reject(e); });
+    });
+  }
+
+  function readChannel(connection, idx, timeoutMs = 3000) {
+    return radioRequest(
+      connection,
+      () => connection.sendCommandGetChannel(idx),
+      RC.ChannelInfo,
+      timeoutMs,
+      (info) => info && info.channelIdx === idx
+    );
+  }
+
+  async function writeChannel(connection, idx, name, secret) {
+    const ok = await radioRequest(
+      connection,
+      () => connection.sendCommandSetChannel(idx, name, secret),
+      RC.Ok,
+      5000
+    );
+    if (!ok) throw new Error(`Node rejected channel slot ${idx}`);
+  }
+
+  // Firmware v3+ reports MAX_GROUP_CHANNELS in the DeviceInfo reply (the
+  // byte meshcore.js exposes as reserved[1]). Returns null when unknown.
+  async function queryMaxChannels(connection) {
+    try {
+      const info = await radioRequest(
+        connection,
+        () => connection.sendCommandDeviceQuery(MeshCoreConstants.SupportedCompanionProtocolVersion),
+        RC.DeviceInfo,
+        3000
+      );
+      if (info && info.firmwareVer >= 3 && info.reserved && info.reserved[1] > 0) {
+        return info.reserved[1];
+      }
+    } catch (e) { /* fall back to probing */ }
+    return null;
+  }
+
+  async function hashtagSecret(name) {
+    if (!(window.crypto && crypto.subtle)) {
+      throw new Error("Secure context (HTTPS) required to derive channel keys");
+    }
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(name));
+    return new Uint8Array(digest).slice(0, 16);
+  }
+
+  // "#LoRadar", "LoRadar", "##LoRadar " -> "#LoRadar". Returns null if invalid.
+  function normalizeHashtagName(raw) {
+    const body = (raw || "").trim().replace(/^#+/, "").trim();
+    if (!body || /\s/.test(body)) return null;
+    const name = `#${body}`;
+    if (new TextEncoder().encode(name).length > CHANNEL_NAME_MAX_BYTES) return null;
+    return name;
+  }
+
+  // Reads every channel slot on the node. Returns
+  // { slots: [{idx, name, secret, secretHex, empty, hashtag}], partial }
+  // or null if the node didn't answer at all.
+  function discoverChannels(connection, onProgress = () => {}) {
+    return withRadio(async () => {
+      const max = (await queryMaxChannels(connection)) || MAX_PROBE_CHANNELS;
+      const slots = [];
+      let partial = false;
+      for (let idx = 0; idx < max; idx++) {
+        onProgress(idx, max);
+        let info;
+        try {
+          info = await readChannel(connection, idx);
+        } catch (e) {
+          try {
+            info = await readChannel(connection, idx); // one retry for flaky BLE
+          } catch (e2) {
+            partial = true;
+            break;
+          }
+        }
+        if (!info) break; // ERR_CODE_NOT_FOUND => past the last slot
+        const name = info.name || "";
+        const secret = info.secret || new Uint8Array(16);
+        const empty = !name && isZeroBytes(secret);
+        let hashtag = false;
+        if (name.startsWith("#")) {
+          try {
+            hashtag = bytesToHex(await hashtagSecret(name)) === bytesToHex(secret);
+          } catch (e) { /* no crypto.subtle */ }
+        }
+        slots.push({ idx, name, secret, secretHex: bytesToHex(secret), empty, hashtag });
+      }
+      if (slots.length === 0 && partial) return null;
+      return { slots, partial };
+    });
+  }
+
+  function channelLabel(ch) {
+    if (ch.name) return ch.name;
+    return ch.idx === 0 ? "Public" : "(unnamed)";
+  }
+
+  // Finds an existing #channel on the node (matched by key, so it works even
+  // if the slot was named differently) or writes it into the first free slot.
+  // Returns {idx, name, secretHex, created}.
+  async function ensureHashtagChannel(connection, rawName, knownSlots = null) {
+    const name = normalizeHashtagName(rawName);
+    if (!name) throw new Error("Enter a channel name like #LoRadar (no spaces, max 30 chars)");
+    const secret = await hashtagSecret(name);
+    const secretHex = bytesToHex(secret);
+
+    let slots = knownSlots;
+    if (!slots) {
+      const result = await discoverChannels(connection);
+      if (!result) throw new Error("Could not read channels from the node");
+      slots = result.slots;
     }
 
-    return channels
-      .sort((a, b) => a.idx - b.idx)
-      .filter((channel, index, arr) => index === 0 || arr[index - 1].idx !== channel.idx);
+    const existing = slots.find((s) => s.secretHex === secretHex);
+    if (existing) return { idx: existing.idx, name: existing.name || name, secretHex, created: false };
+
+    const free = slots.find((s) => s.empty && s.idx !== 0);
+    if (!free) throw new Error("No free channel slots on the node — delete one in the MeshCore app");
+
+    await withRadio(async () => {
+      await writeChannel(connection, free.idx, name, secret);
+      const check = await readChannel(connection, free.idx);
+      if (!check || bytesToHex(check.secret) !== secretHex) {
+        throw new Error("Node did not save the channel");
+      }
+    });
+    return { idx: free.idx, name, secretHex, created: true };
   }
 
-  // Fetches configured channels from the connected node (used by the
-  // wizard's channel-selection step), racing against a timeout since the
-  // companion protocol has no built-in timeout for repeated GetChannel
-  // requests and a non-responding/older-firmware node would otherwise hang
-  // the wizard indefinitely.
-  async function discoverChannels(
-    connection,
-    timeoutMs = state.transport === "bluetooth" ? 20000 : 8000
-  ) {
-    const timeout = new Promise((resolve) => setTimeout(() => resolve(null), timeoutMs));
+  function applyChannelSelection(ch) {
+    state.channel = ch.idx;
+    saveLocal("loradar.channel", ch);
+    if (!state.stationConfig) {
+      $("#regionLabel").textContent = `Listening on ch ${ch.idx} (${channelLabel(ch)})`;
+    }
+  }
+
+  // Slot indices shift if the user deletes/reorders channels in the MeshCore
+  // app, so on each (re)connect we confirm the saved channel is still where
+  // we think it is, relocating (or re-adding a #channel) if it moved.
+  async function verifySavedChannel(connection) {
+    const saved = loadLocal("loradar.channel");
+    if (!connection || !saved || !saved.secretHex) return;
     try {
-      const result = await Promise.race([connection.getChannels(), timeout]);
-      if (!result) return null;
-      return normalizeDiscoveredChannels(result);
+      const current = await withRadio(() => readChannel(connection, saved.idx));
+      if (current && bytesToHex(current.secret) === saved.secretHex) return;
+
+      const result = await discoverChannels(connection);
+      if (!result) return;
+      const moved = result.slots.find((s) => s.secretHex === saved.secretHex);
+      if (moved) {
+        applyChannelSelection({ ...saved, idx: moved.idx });
+        toast(`${channelLabel(saved)} found on ch ${moved.idx}.`);
+        return;
+      }
+      if (saved.name && saved.name.startsWith("#")) {
+        const ch = await ensureHashtagChannel(connection, saved.name, result.slots);
+        applyChannelSelection({ idx: ch.idx, name: ch.name, secretHex: ch.secretHex });
+        toast(`Re-added ${ch.name} to the node on ch ${ch.idx}.`);
+        return;
+      }
+      toast(`Channel ${channelLabel(saved)} is no longer on the node — pick one in ⚙ settings.`, 5000);
     } catch (e) {
-      return null;
+      console.warn("verifySavedChannel failed", e);
     }
   }
 
@@ -730,7 +916,8 @@ import {
   const Wizard = {
     currentStep: 1,
     chosenTransport: null,
-    chosenChannel: null, // {idx, name}
+    chosenChannel: null, // {idx, name, secretHex}
+    channelSlots: null, // last discovered slots from the node
     chosenLocation: null,
 
     init() {
@@ -762,47 +949,69 @@ import {
     },
 
     // Queries the connected node for existing channels and renders them as
-    // pickable buttons; falls back to manual number entry if discovery
-    // fails/times out (e.g. older firmware, node not responding).
+    // pickable buttons, plus a "join/create #channel" form; falls back to
+    // manual number entry if discovery fails (e.g. node not responding).
     async loadChannelOptions() {
       const container = $("#channelListContainer");
       const statusHint = $("#channelStatusHint");
       const manualFields = $("#manualChannelFields");
+      const createFields = $("#createChannelFields");
       container.innerHTML = "";
-      statusHint.textContent = state.transport === "bluetooth"
-        ? "Reading channels from connected node (BLE discovery can take several seconds)..."
-        : "Reading channels from connected node...";
+      this.chosenChannel = null;
+      this.channelSlots = null;
+      $("#step2Next").disabled = true;
+      $("#rescanChannelsBtn").disabled = true;
+      statusHint.textContent = "Reading channels from connected node...";
 
-      if (!state.mcConnection) {
+      if (!state.mcConnection || !state.connected) {
         statusHint.textContent = "Not connected to a node — enter the channel number manually.";
         manualFields.classList.remove("hidden");
+        createFields.classList.add("hidden");
+        $("#rescanChannelsBtn").disabled = false;
         return;
       }
+      createFields.classList.remove("hidden");
 
-      const channels = await discoverChannels(state.mcConnection);
-      if (!channels || channels.length === 0) {
+      const result = await discoverChannels(state.mcConnection, (idx, max) => {
+        statusHint.textContent = `Reading channels from connected node... (${idx + 1}/${max})`;
+      });
+      $("#rescanChannelsBtn").disabled = false;
+
+      if (!result) {
         statusHint.textContent =
-          "Could not read channels automatically. Enter the channel number manually " +
-          "(matching what you configured in the MeshCore companion app).";
+          "Could not read channels automatically. Join a #channel below or enter the " +
+          "channel number manually (matching what you configured in the MeshCore companion app).";
         manualFields.classList.remove("hidden");
         return;
       }
 
-      statusHint.textContent = "Select the channel matching your MeshCore companion app:";
+      this.channelSlots = result.slots;
+      const used = result.slots.filter((s) => !s.empty);
+      const saved = loadLocal("loradar.channel");
+
+      statusHint.textContent = used.length
+        ? "Select the channel the LoRadar base station broadcasts on, or join a #channel below:"
+        : "No channels configured on the node yet — join a #channel below.";
+      if (result.partial) {
+        statusHint.textContent += " (Node stopped responding part-way; list may be incomplete.)";
+      }
       manualFields.classList.add("hidden");
-      channels.forEach(({ idx, name }) => {
+
+      used.forEach((slot) => {
         const btn = document.createElement("button");
         btn.className = "channelBtn";
         btn.type = "button";
-        const label = name && name !== "Public" ? `#${name}` : (idx === 0 ? "Public (default)" : "(unnamed)");
-        btn.innerHTML = `<span>${label}</span><span class="idx">ch ${idx}</span>`;
-        btn.addEventListener("click", () => {
-          $all(".channelBtn").forEach((b) => b.classList.remove("selected"));
-          btn.classList.add("selected");
-          this.chosenChannel = { idx, name: name || (idx === 0 ? "Public" : "") };
-          $("#step2Next").disabled = false;
-        });
+        const labelEl = document.createElement("span");
+        labelEl.textContent = channelLabel(slot) + (slot.idx === 0 && slot.name === "Public" ? " (default)" : "");
+        const idxEl = document.createElement("span");
+        idxEl.className = "idx";
+        idxEl.textContent = `ch ${slot.idx}`;
+        btn.append(labelEl, idxEl);
+        btn.addEventListener("click", () => this.selectChannel(btn, slot));
         container.appendChild(btn);
+        if (saved && saved.secretHex && saved.secretHex === slot.secretHex) {
+          this.selectChannel(btn, slot);
+        }
       });
 
       // Still allow manual override even when discovery succeeds.
@@ -810,10 +1019,51 @@ import {
       manualToggle.className = "btn ghost";
       manualToggle.type = "button";
       manualToggle.style.width = "100%";
-      manualToggle.style.marginTop = "8px";
+      manualToggle.style.marginTop = "4px";
       manualToggle.textContent = "Enter channel number manually instead";
-      manualToggle.addEventListener("click", () => manualFields.classList.remove("hidden"));
+      manualToggle.addEventListener("click", () => {
+        $all(".channelBtn").forEach((b) => b.classList.remove("selected"));
+        this.chosenChannel = null;
+        manualFields.classList.remove("hidden");
+        $("#step2Next").disabled = false;
+      });
       container.appendChild(manualToggle);
+    },
+
+    selectChannel(btn, slot) {
+      $all(".channelBtn").forEach((b) => b.classList.remove("selected"));
+      btn.classList.add("selected");
+      $("#manualChannelFields").classList.add("hidden");
+      this.chosenChannel = { idx: slot.idx, name: slot.name || (slot.idx === 0 ? "Public" : ""), secretHex: slot.secretHex };
+      $("#step2Next").disabled = false;
+    },
+
+    async joinHashtagChannel() {
+      const btn = $("#createChannelBtn");
+      const hint = $("#createChannelHint");
+      if (!state.mcConnection || !state.connected) {
+        hint.textContent = "Connect to a node first.";
+        return;
+      }
+      btn.disabled = true;
+      hint.textContent = "Adding channel to node...";
+      try {
+        const ch = await ensureHashtagChannel(state.mcConnection, $("#createChannelInput").value, this.channelSlots);
+        const chosen = { idx: ch.idx, name: ch.name, secretHex: ch.secretHex };
+        saveLocal("loradar.channel", chosen);
+        await this.loadChannelOptions();
+        if (!this.chosenChannel || this.chosenChannel.secretHex !== ch.secretHex) {
+          this.chosenChannel = chosen; // list refresh failed; keep the result anyway
+          $("#step2Next").disabled = false;
+        }
+        hint.textContent = ch.created
+          ? `Added ${ch.name} to the node on ch ${ch.idx} and selected it.`
+          : `${ch.name} already exists on ch ${ch.idx} — selected it.`;
+      } catch (e) {
+        hint.textContent = e.message || String(e);
+      } finally {
+        btn.disabled = false;
+      }
     },
 
     bindEvents() {
@@ -829,9 +1079,18 @@ import {
       $("#step1Next").addEventListener("click", async () => {
         const btn = $("#step1Next");
         const statusHint = $("#connectStatusHint");
+        saveLocal("loradar.transport", this.chosenTransport);
+
+        // Re-running setup from ⚙ while already connected: reuse the link.
+        if (state.connected && state.mcConnection && state.transport === this.chosenTransport) {
+          this.showStep(2);
+          this.loadChannelOptions();
+          return;
+        }
+        if (state.connected) await disconnectTransport();
+
         btn.disabled = true;
         statusHint.textContent = "Connecting to MeshCore node...";
-        saveLocal("loradar.transport", this.chosenTransport);
         state.transport = this.chosenTransport;
 
         const ok = this.chosenTransport === "bluetooth" ? await connectBluetooth() : await connectSerial();
@@ -845,20 +1104,35 @@ import {
         this.loadChannelOptions();
       });
 
-      // Step 2: channel selection
+      // Step 2: channel selection / #channel creation
       $("#step2Back").addEventListener("click", () => this.showStep(1));
+      $("#rescanChannelsBtn").addEventListener("click", () => this.loadChannelOptions());
+      $("#createChannelBtn").addEventListener("click", () => this.joinHashtagChannel());
+      $("#createChannelInput").addEventListener("keydown", (e) => {
+        if (e.key === "Enter") this.joinHashtagChannel();
+      });
+      $("#channelNumberInput").addEventListener("input", () => {
+        $all(".channelBtn").forEach((b) => b.classList.remove("selected"));
+        this.chosenChannel = null;
+        $("#step2Next").disabled = $("#channelNumberInput").value.trim() === "";
+      });
       $("#step2Next").addEventListener("click", () => {
         if (!this.chosenChannel) {
           const idx = parseInt($("#channelNumberInput").value, 10);
-          if (isNaN(idx) || idx < 0 || idx > 7) {
-            toast("Enter a valid channel number (0-7).");
+          const maxIdx = this.channelSlots && this.channelSlots.length ? this.channelSlots.length - 1 : MAX_PROBE_CHANNELS - 1;
+          if (isNaN(idx) || idx < 0 || idx > maxIdx) {
+            toast(`Enter a valid channel number (0-${maxIdx}).`);
             return;
           }
           const name = $("#channelNameInput").value.trim();
-          this.chosenChannel = { idx, name: name || (idx === 0 ? "Public" : "") };
+          const slot = this.channelSlots && this.channelSlots.find((s) => s.idx === idx);
+          this.chosenChannel = {
+            idx,
+            name: name || (slot && slot.name) || (idx === 0 ? "Public" : ""),
+            secretHex: slot && !slot.empty ? slot.secretHex : undefined,
+          };
         }
-        state.channel = this.chosenChannel.idx;
-        saveLocal("loradar.channel", this.chosenChannel);
+        applyChannelSelection(this.chosenChannel);
         this.showStep(3);
       });
 
@@ -976,8 +1250,15 @@ import {
       state.stationConfig = savedConfig;
       $("#regionLabel").textContent = `${savedConfig.stationId || "Unknown"} · cached config`;
     } else {
-      const chLabel = savedChannel.name && savedChannel.name !== "Public" ? `#${savedChannel.name}` : "Public";
-      $("#regionLabel").textContent = `Listening on channel ${savedChannel.idx} (${chLabel})`;
+      $("#regionLabel").textContent = `Listening on ch ${savedChannel.idx} (${channelLabel(savedChannel)})`;
+    }
+
+    // Re-running the wizard from ⚙ calls this again; the map, listeners and
+    // (usually) the radio link already exist, so only refresh what changed.
+    if (state.map) {
+      if (savedLocation && !state._userPanned) state.map.setView([savedLocation.lat, savedLocation.lon], 10);
+      if (!state.connected) connectUsingSavedTransport();
+      return;
     }
 
     initMap(lat, lon);
@@ -985,7 +1266,8 @@ import {
 
     if (savedLocation) updateGpsMarker(savedLocation.lat, savedLocation.lon);
 
-    connectUsingSavedTransport();
+    if (state.connected) verifySavedChannel(state.mcConnection);
+    else connectUsingSavedTransport();
 
     $("#reconnectBtn").addEventListener("click", async () => {
       if (state.connected) await disconnectTransport();

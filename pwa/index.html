@@ -79,6 +79,7 @@
     padding: 20px;
   }
   #onboarding.hidden { display: none; }
+  .hidden { display: none !important; }
   .wizardCard {
     width: 100%; max-width: 480px; background: var(--panel);
     border: 1px solid rgba(255,255,255,0.08); border-radius: 16px;
@@ -165,6 +166,12 @@
   .channelBtn .idx {
     background: rgba(255,255,255,0.1); border-radius: 6px; padding: 2px 8px; font-size: 11px;
   }
+  .createChannel {
+    margin-top: 14px; padding-top: 12px; border-top: 1px solid rgba(255,255,255,0.1);
+  }
+  .inlineRow { display: flex; gap: 8px; align-items: flex-start; }
+  .inlineRow input { flex: 1; margin-bottom: 0; }
+  .inlineRow .btn { flex: 0 0 auto; padding: 10px 14px; }
 </style>
 </head>
 <body>
@@ -223,13 +230,25 @@
     <!-- Step 2: Channel Selection -->
     <div class="wizStep hidden" id="step2">
       <h2>Step 2 — Select MeshCore Channel</h2>
-      <p class="hint">Radar data broadcasts on a specific MeshCore channel — it should
-      match a channel you've already created in the MeshCore companion app (e.g. a
-      dedicated "#LoRadar" channel), <strong>not</strong> the default Public channel,
-      so it doesn't mix in with public chat.</p>
+      <p class="hint">Radar data broadcasts on a specific MeshCore channel — pick the one
+      the LoRadar base station uses (e.g. a dedicated <strong>#LoRadar</strong> hashtag
+      channel), <strong>not</strong> the default Public channel, so it doesn't mix in
+      with public chat.</p>
       <div id="channelListContainer"></div>
       <div class="hint" id="channelStatusHint">Reading channels from connected node...</div>
-      <div id="manualChannelFields" style="margin-top:12px;">
+      <div id="createChannelFields" class="createChannel">
+        <label class="fieldLabel" for="createChannelInput">Join or create a #channel on this node</label>
+        <div class="inlineRow">
+          <input type="text" id="createChannelInput" placeholder="#LoRadar" autocomplete="off"
+                 autocapitalize="off" spellcheck="false" maxlength="31" />
+          <button class="btn primary" id="createChannelBtn" type="button">Add &amp; listen</button>
+        </div>
+        <div class="hint" id="createChannelHint">Hashtag channel keys are derived from the name, so
+        it must match the base station's channel exactly (case-sensitive). If it's already on the
+        node it is just selected; otherwise it's saved into a free slot.</div>
+        <button class="btn ghost" id="rescanChannelsBtn" type="button" style="width:100%;margin-top:8px;">Rescan channels</button>
+      </div>
+      <div id="manualChannelFields" class="hidden" style="margin-top:12px;">
         <label class="fieldLabel">Channel number (matches the MeshCore companion app)</label>
         <input type="text" id="channelNumberInput" placeholder="e.g. 2" />
         <label class="fieldLabel">Channel name (for your reference only)</label>

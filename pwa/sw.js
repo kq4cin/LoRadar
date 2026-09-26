@@ -5,7 +5,7 @@
  * Cache API's URL matching.
  */
 
-const CACHE_NAME = "loradar-shell-v1";
+const CACHE_NAME = "loradar-shell-v2";
 
 const APP_SHELL = [
   "./",
