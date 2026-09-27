@@ -21,13 +21,41 @@ LoRadar/
 
 ## 1. Backend Server Setup
 
-Requirements: Python 3.9+, and [`meshcore-cli`](https://github.com/meshcore-dev/meshcore-cli)
-installed and on your `PATH` (or point `meshcore_cli_path` in `config.json`
-at it):
+If you want to run the server on a **Raspberry Pi**, the easiest path is below.
+You need Python 3.9+ and
+[`meshcore-cli`](https://github.com/meshcore-dev/meshcore-cli). On other
+systems, the same setup still applies.
+
+### Raspberry Pi quick start
+
+1. Start with **Raspberry Pi OS** and make sure the Pi is online.
+2. Open a terminal.
+3. Install the needed packages:
+
+```bash
+sudo apt update
+sudo apt install -y git python3 python3-pip pipx
+pipx ensurepath
+```
+
+4. Close and reopen the terminal so `pipx` is on your `PATH`.
+5. Install [`meshcore-cli`](https://github.com/meshcore-dev/meshcore-cli):
 
 ```bash
 pipx install meshcore-cli
-# or: pip install meshcore-cli
+```
+
+6. Download this project and move into the folder:
+
+```bash
+git clone https://github.com/kq4cin/LoRadar.git
+cd LoRadar
+```
+
+7. Run the first-time setup wizard:
+
+```bash
+python3 server.py --setup
 ```
 
 `server.py` never writes raw bytes to the node — stock MeshCore companion
@@ -35,11 +63,6 @@ firmware only understands its own structured companion protocol, so all
 dispatch is done through `meshcore-cli`'s documented `chan <n> <msg>`
 command, which handles channel routing/encryption exactly like the
 companion app does.
-
-```bash
-cd LoRadar
-python server.py --setup
-```
 
 The wizard will:
 1. Ask for your ZIP code / city or lat-lon.
@@ -61,17 +84,30 @@ The wizard will:
 > shows up in the auto-discovered channel list and other mesh users aren't
 > spammed with radar frames on Public chat.
 
-Run the broadcast loop:
+8. Start the broadcast loop:
 
 ```bash
-python server.py --run
+python3 server.py --run
 ```
 
-Debug helpers:
+If `meshcore-cli` says "command not found", either open a new terminal or run
+it directly with:
 
 ```bash
-python server.py --dump   # print packed 0xCF/0x10 frames as hex, no serial write
-python server.py --once   # send a single update cycle then exit
+~/.local/bin/meshcore-cli --help
+```
+
+### Notes for setup
+
+- Use **USB serial** if your MeshCore node is plugged into the Pi with USB.
+- Use **Bluetooth (BLE)** only if the Pi already sees your node over Bluetooth.
+- Use **TCP/WiFi bridge** only if your node is already reachable by IP address.
+
+### Debug helpers
+
+```bash
+python3 server.py --dump   # print packed 0xCF/0x10 frames as hex, no serial write
+python3 server.py --once   # send a single update cycle then exit
 ```
 
 ### Packet formats
