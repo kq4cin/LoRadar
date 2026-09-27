@@ -34,6 +34,13 @@ systems, the same setup still applies.
 
 ```bash
 sudo apt update
+sudo apt install -y git python3 python3-pip pipx
+python3 -m pipx ensurepath
+```
+
+If your Pi says it cannot find the `pipx` package, use this fallback instead:
+
+```bash
 sudo apt install -y git python3 python3-pip
 python3 -m pip install --user pipx
 python3 -m pipx ensurepath
