@@ -34,8 +34,9 @@ systems, the same setup still applies.
 
 ```bash
 sudo apt update
-sudo apt install -y git python3 python3-pip pipx
-pipx ensurepath
+sudo apt install -y git python3 python3-pip
+python3 -m pip install --user pipx
+python3 -m pipx ensurepath
 ```
 
 4. Close and reopen the terminal so `pipx` is on your `PATH`.
