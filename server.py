@@ -417,6 +417,69 @@ def _connection_args(cfg: Config) -> List[str]:
         raise ValueError(f"Unknown connection_mode: {cfg.connection_mode}")
 
 
+def _cli_path(cfg: Config) -> str:
+    return os.path.expanduser(os.path.expandvars(cfg.meshcore_cli_path or "meshcore-cli"))
+
+
+def find_meshcore_cli() -> Optional[str]:
+    """Locate the meshcore-cli executable: first next to the running Python
+    (same venv), then on PATH, then in common pipx/venv install locations."""
+    import shutil
+
+    exe_names = ["meshcore-cli.exe", "meshcli.exe"] if os.name == "nt" else ["meshcore-cli", "meshcli"]
+    candidates = [os.path.join(os.path.dirname(sys.executable), n) for n in exe_names]
+    for n in exe_names:
+        found = shutil.which(n)
+        if found:
+            candidates.append(found)
+    home = os.path.expanduser("~")
+    candidates += [
+        os.path.join(home, ".venvs", "meshcore-cli", "bin", "meshcore-cli"),
+        os.path.join(home, ".local", "bin", "meshcore-cli"),
+    ]
+    for c in candidates:
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return None
+
+
+def detect_serial_ports() -> List[str]:
+    """List likely USB serial ports for a MeshCore companion radio, preferring
+    stable /dev/serial/by-id/ paths on Linux (they survive reboots/replugs)."""
+    import glob
+
+    if os.name == "nt":
+        try:
+            from serial.tools import list_ports  # pyserial, installed with meshcore
+            return [p.device for p in list_ports.comports()]
+        except Exception:
+            return []
+
+    by_id = sorted(glob.glob("/dev/serial/by-id/*"))
+    if by_id:
+        return by_id
+    return sorted(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*") + glob.glob("/dev/cu.usb*"))
+
+
+def probe_node(cfg: Config) -> Optional[str]:
+    """Try `meshcore-cli ... -j infos` against the configured connection.
+    Returns the node's name on success, or None if unreachable."""
+    import subprocess
+
+    try:
+        cmd = [_cli_path(cfg), "-j"] + _connection_args(cfg) + ["infos"]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+    except Exception:
+        return None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    try:
+        data = json.loads(result.stdout)
+        return str(data.get("name") or "MeshCore node") if isinstance(data, dict) else "MeshCore node"
+    except ValueError:
+        return "MeshCore node"
+
+
 class MeshCoreTransport:
     """Sends frames to a stock MeshCore companion-radio node by shelling out
     to `meshcore-cli`, targeting the user-configured channel number via the
@@ -437,7 +500,7 @@ class MeshCoreTransport:
         import subprocess
 
         hex_payload = frame.hex()
-        cmd = [self.cfg.meshcore_cli_path] + _connection_args(self.cfg) + [
+        cmd = [_cli_path(self.cfg)] + _connection_args(self.cfg) + [
             "chan",
             str(self.cfg.channel),
             hex_payload,
@@ -454,7 +517,7 @@ def discover_channels(cfg: Config) -> Optional[List[Tuple[int, str]]]:
     import subprocess
 
     try:
-        cmd = [cfg.meshcore_cli_path, "-j"] + _connection_args(cfg) + ["get_channels"]
+        cmd = [_cli_path(cfg), "-j"] + _connection_args(cfg) + ["get_channels"]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
         if result.returncode != 0 or not result.stdout.strip():
             return None
@@ -497,14 +560,18 @@ def dispatch_frames(cfg: Config, frames: List[bytes]) -> None:
 # ---------------------------------------------------------------------------
 
 def prompt(msg: str, default: Optional[str] = None) -> str:
+    import re
+
     suffix = f" [{default}]" if default is not None else ""
-    val = input(f"{msg}{suffix}: ").strip()
+    val = input(f"{msg}{suffix}: ")
+    # Strip stray terminal escape sequences (e.g. arrow keys show up as ^[[C).
+    val = re.sub(r"\x1b\[[0-9;]*[A-Za-z~]|\x1b.|[\x00-\x1f\x7f]", "", val).strip()
     return val if val else (default or "")
 
 
 def run_setup_wizard() -> None:
     print("=" * 60)
-    print(" LoRadar Setup Wizard — Off-Grid Weather Radar over LoRa")
+    print(" LoRadar Setup Wizard - Off-Grid Weather Radar over LoRa")
     print("=" * 60)
 
     cfg = Config()
@@ -557,9 +624,9 @@ def run_setup_wizard() -> None:
         idle_interval = update_interval
 
     print("\nStep 3: MeshCore Connection")
-    print("  1) USB Serial — connect via cable to the companion-radio device")
-    print("  2) Bluetooth (BLE) — connect wirelessly via Nordic UART Service")
-    print("  3) TCP / WiFi bridge — connect via a network-attached MeshCore bridge")
+    print("  1) USB Serial - connect via cable to the companion-radio device")
+    print("  2) Bluetooth (BLE) - connect wirelessly via Nordic UART Service")
+    print("  3) TCP / WiFi bridge - connect via a network-attached MeshCore bridge")
     conn_choice = prompt(
         "Choose connection mode",
         {"serial": "1", "ble": "2", "tcp": "3"}.get(cfg.connection_mode, "1"),
@@ -571,12 +638,37 @@ def run_setup_wizard() -> None:
     ble_address = cfg.ble_address
     tcp_host = cfg.tcp_host
     tcp_port = cfg.tcp_port
-    cli_path = prompt("Path to meshcore-cli executable", cfg.meshcore_cli_path or "meshcore-cli")
+    detected_cli = find_meshcore_cli()
+    saved_cli = cfg.meshcore_cli_path if cfg.meshcore_cli_path not in ("", "meshcore-cli") else None
+    if detected_cli and not saved_cli:
+        print(f"  Found meshcore-cli at {detected_cli}")
+    cli_path = prompt("Path to meshcore-cli executable", saved_cli or detected_cli or "meshcore-cli")
+    cli_path = os.path.expanduser(cli_path)
+    if os.sep in cli_path and not os.path.isfile(cli_path):
+        print(f"  ! Warning: {cli_path} does not exist.")
 
     if connection_mode == "serial":
-        default_port = cfg.serial_port or ("COM3" if os.name == "nt" else "/dev/ttyUSB0")
-        serial_port = prompt("Serial port", default_port)
-        baud_rate = int(prompt("Baud rate", str(cfg.baud_rate or 115200)))
+        baud_rate = cfg.baud_rate or 115200
+        ports = detect_serial_ports()
+        found_port = None
+        if ports:
+            print(f"  Detected serial port(s): {', '.join(ports)}")
+            print("  Checking each one for a MeshCore companion radio...")
+            for port in ports:
+                node = probe_node(Config(connection_mode="serial", serial_port=port,
+                                         baud_rate=baud_rate, meshcore_cli_path=cli_path))
+                if node:
+                    print(f"  -> Connected to '{node}' on {port}")
+                    found_port = port
+                    break
+            if not found_port:
+                print("  ! No MeshCore node answered. Is the radio plugged in, flashed with")
+                print("    USB/Serial companion firmware, and not open in another program?")
+        else:
+            print("  ! No USB serial devices found. Check the cable (it must be a data cable).")
+        default_port = found_port or cfg.serial_port or (ports[0] if ports else
+                                                         ("COM3" if os.name == "nt" else "/dev/ttyACM0"))
+        serial_port = prompt("Serial port (press Enter to accept)", default_port)
     elif connection_mode == "ble":
         ble_address = prompt(
             "BLE device name/address (leave blank to auto-select first paired device)",
@@ -598,7 +690,7 @@ def run_setup_wizard() -> None:
 
     print("\nStep 4: Channel Selection")
     print("Radar data should normally broadcast on a DEDICATED channel, not the")
-    print("default Public channel (0) — that keeps it from cluttering public chat")
+    print("default Public channel (0) - that keeps it from cluttering public chat")
     print("for other mesh users. In the MeshCore companion app, create a channel")
     print("(e.g. named '#LoRadar') under the Channels tab, note its channel")
     print("number, then match it here.")
@@ -621,7 +713,7 @@ def run_setup_wizard() -> None:
         match = next((n for i, n in discovered if i == channel), None)
         channel_name = match if match else prompt("Channel name (for your reference)", channel_name or "")
     else:
-        print("  (Could not read channels automatically — node may be offline or")
+        print("  (Could not read channels automatically - node may be offline or")
         print("   unreachable right now. Enter the channel number manually; you")
         print("   can verify it later with: meshcore-cli get_channels)")
         channel = int(prompt("Channel number to broadcast on (0 = Public)", str(cfg.channel or 0)))
