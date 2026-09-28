@@ -42,7 +42,9 @@ from typing import List, Optional, Tuple
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
-NWS_USER_AGENT = "LoRadar/1.0 (contact: example@example.com)"
+# Nominatim and api.weather.gov both require an identifying User-Agent;
+# Nominatim returns 403 for placeholder contacts like example.com.
+NWS_USER_AGENT = "LoRadar/1.0 (+https://github.com/kq4cin/LoRadar)"
 
 # dBZ binning: 15..75 dBZ compressed into a 6-bit-ish level, but we keep it
 # simple and store the raw dBZ (clamped 15-75) directly as a single byte
@@ -128,8 +130,24 @@ def http_get_json(url: str, timeout: float = 15.0) -> dict:
 
 def geocode_zip_or_city(query: str) -> Tuple[float, float]:
     """Resolve a ZIP code or 'City, State' string to lat/lon using the free
-    Nominatim (OpenStreetMap) geocoding API. No API key required."""
-    url = f"https://nominatim.openstreetmap.org/search?q={urllib.parse.quote(query)}&format=json&limit=1"
+    Nominatim (OpenStreetMap) geocoding API. US ZIP codes are resolved via
+    zippopotam.us first. No API key required."""
+    query = query.strip()
+    if query.isdigit() and len(query) == 5:
+        try:
+            req = urllib.request.Request(
+                f"https://api.zippopotam.us/us/{query}", headers={"User-Agent": NWS_USER_AGENT}
+            )
+            with urllib.request.urlopen(req, timeout=15.0) as resp:
+                place = json.loads(resp.read().decode("utf-8"))["places"][0]
+            return float(place["latitude"]), float(place["longitude"])
+        except (urllib.error.URLError, KeyError, IndexError, ValueError):
+            pass  # fall through to Nominatim
+
+    url = (
+        f"https://nominatim.openstreetmap.org/search?q={urllib.parse.quote(query)}"
+        "&format=json&limit=1&countrycodes=us"
+    )
     req = urllib.request.Request(url, headers={"User-Agent": NWS_USER_AGENT})
     with urllib.request.urlopen(req, timeout=15.0) as resp:
         results = json.loads(resp.read().decode("utf-8"))
@@ -507,8 +525,13 @@ def run_setup_wizard() -> None:
     else:
         query = prompt("ZIP code or 'City, State'", "Nashville, TN")
         print(f"Geocoding '{query}'...")
-        lat, lon = geocode_zip_or_city(query)
-        print(f"  -> resolved to {lat:.4f}, {lon:.4f}")
+        try:
+            lat, lon = geocode_zip_or_city(query)
+            print(f"  -> resolved to {lat:.4f}, {lon:.4f}")
+        except Exception as exc:
+            print(f"  ! Geocoding failed ({exc}). Enter coordinates manually.")
+            lat = float(prompt("Latitude", str(cfg.center_lat or 36.16)))
+            lon = float(prompt("Longitude", str(cfg.center_lon or -86.78)))
 
     print("\nStep 2: Discovering nearest NEXRAD station via api.weather.gov...")
     try:
