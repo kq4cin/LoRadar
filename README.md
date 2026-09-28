@@ -57,11 +57,23 @@ python3 -m venv ~/.venvs/meshcore-cli
 pipx install meshcore-cli
 ```
 
-If you used the virtual-environment fallback above, skip the `pipx install`
-step. During `python3 server.py --setup`, either activate that virtual
-environment first or enter
-`~/.venvs/meshcore-cli/bin/meshcore-cli` when LoRadar asks for the
-`meshcore-cli` executable path.
+If you used the virtual-environment fallback above, **do not run** the
+`pipx install meshcore-cli` step.
+
+When you run `python3 server.py --setup`, LoRadar will ask where
+`meshcore-cli` is. You can answer in either way:
+
+- **Option A (activate first):**
+
+  ```bash
+  source ~/.venvs/meshcore-cli/bin/activate
+  ```
+
+  Then run `python3 server.py --setup`.
+
+- **Option B (full path):** Enter this path when prompted:
+
+  `~/.venvs/meshcore-cli/bin/meshcore-cli`
 
 6. Download this project and move into the folder:
 
