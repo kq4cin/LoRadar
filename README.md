@@ -223,7 +223,8 @@ Other options: `--replay-gap SEC` (air time between frames), `--test-hold SEC`.
   late-joining clients auto-configure.
 - **`0x10` Sparse Radar Frame (≤36 bytes)**: header, sequence number, active
   cell count N (≤16), N × `[cell_index, dBZ]` pairs, CRC8. Worst case
-  (N=16) is exactly 3 + 2×16 + 1 = 36 bytes.
+  (N=16) is exactly 3 + 2×16 + 1 = 36 bytes. Test/drill data uses header
+  `0x11` with the identical layout, so clients can label and discard it.
 
 Both use the same CRC8 (poly `0x07`) implementation in `server.py` and
 `app.js`, verified to match byte-for-byte. Each frame is hex-encoded (36
@@ -315,6 +316,12 @@ After setup, the app:
   **■ Stop** to return to the live picture. New updates arriving during
   playback join the loop automatically. History is cleared if the base
   station's coverage area changes.
+- Shows drill data (`--test`, `--test-storm`, `--test-replay`) with a yellow
+  **TEST DATA** label. When the server restores live radar after a drill,
+  the test frames are dropped from the loop automatically, so no refresh
+  is needed. **✕ Clear** wipes the loop history (and any test data still on
+  screen) manually. Reloading the page does *not* clear history and
+  disconnects the radio, so use Clear instead.
 
 Browser support notes: WebBluetooth and WebSerial are supported in
 Chrome/Edge (desktop and Android). iOS Safari supports neither API as of

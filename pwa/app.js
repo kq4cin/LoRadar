@@ -33,6 +33,7 @@ import {
   const GRID_SIZE = 16;
   const FRAME_CONFIG = 0xcf;
   const FRAME_RADAR = 0x10;
+  const FRAME_RADAR_TEST = 0x11; // server drill/test data, same layout as 0x10
 
   const TILE_ZOOMS = [8, 9, 10, 11];
   const TILE_RADIUS_CELLS = 4; // tiles around center per zoom, in each direction
@@ -355,11 +356,11 @@ import {
   // ------------------------------------------------------------------
   // Radar playback loop (last HISTORY_SIZE frames)
   // ------------------------------------------------------------------
-  function recordRadarHistory(seq, cells, ts) {
+  function recordRadarHistory(seq, cells, ts, test = false) {
     const last = state.radarHistory[state.radarHistory.length - 1];
     // Mesh flooding can deliver the same message more than once; skip repeats.
     if (last && last.seq === seq && JSON.stringify(last.cells) === JSON.stringify(cells)) return;
-    state.radarHistory.push({ ts, seq, cells });
+    state.radarHistory.push(test ? { ts, seq, cells, test } : { ts, seq, cells });
     while (state.radarHistory.length > HISTORY_SIZE) state.radarHistory.shift();
     saveLocal("loradar.radarHistory", state.radarHistory);
     if (state.playback.playing) {
@@ -380,6 +381,7 @@ import {
     const pb = state.playback;
     const btn = $("#playBtn");
     btn.disabled = hist.length < 2;
+    $("#clearBtn").disabled = hist.length === 0 && state.sparseCells.length === 0;
     btn.textContent = pb.playing ? "■ Stop" : "▶ Loop";
     btn.classList.toggle("playing", pb.playing);
 
@@ -395,7 +397,8 @@ import {
       label.textContent = "No history yet";
       label.classList.remove("historic");
     } else if (pb.playing && hist[pb.index]) {
-      label.textContent = `${pb.index + 1}/${hist.length} · ${formatAge(hist[pb.index].ts)}`;
+      label.textContent = `${pb.index + 1}/${hist.length} · ${formatAge(hist[pb.index].ts)}` +
+        (hist[pb.index].test ? " · TEST" : "");
       label.classList.toggle("historic", pb.index < hist.length - 1);
     } else {
       label.textContent = hist.length < 2
@@ -434,9 +437,28 @@ import {
     updatePlaybackUi();
   }
 
+  // Wipe the loop history (e.g. after a drill). The current live picture is
+  // kept as the first frame; test data on screen is cleared too.
+  function clearRadarHistory() {
+    if (state.playback.playing) stopPlayback();
+    const last = state.radarHistory[state.radarHistory.length - 1];
+    state.radarHistory = last && !last.test ? [last] : [];
+    saveLocal("loradar.radarHistory", state.radarHistory);
+    if (state.showingTest) {
+      state.sparseCells = [];
+      state.showingTest = false;
+      $("#lastUpdate").textContent = "Test cleared - waiting for next radar update";
+      $("#lastUpdate").classList.remove("test");
+    }
+    drawRadarOverlay();
+    updatePlaybackUi();
+    toast("Radar history cleared");
+  }
+
   function initPlayback() {
     const saved = loadLocal("loradar.radarHistory", []);
     if (Array.isArray(saved) && state.radarHistory.length === 0) state.radarHistory = saved.slice(-HISTORY_SIZE);
+    $("#clearBtn").addEventListener("click", clearRadarHistory);
     $("#playBtn").addEventListener("click", () => {
       if (state.playback.playing) stopPlayback();
       else startPlayback();
@@ -494,8 +516,8 @@ import {
 
     if (header === FRAME_CONFIG) {
       parseConfigFrame(bytes);
-    } else if (header === FRAME_RADAR) {
-      parseRadarFrame(bytes);
+    } else if (header === FRAME_RADAR || header === FRAME_RADAR_TEST) {
+      parseRadarFrame(bytes, header === FRAME_RADAR_TEST);
     }
     // Unknown headers are silently ignored (forward compatibility).
   }
@@ -550,8 +572,8 @@ import {
     drawRadarOverlay();
   }
 
-  function parseRadarFrame(bytes) {
-    // Byte 0: 0x10 | Byte 1: seq | Byte 2: N | N*(cellIndex,dbz) | CRC8
+  function parseRadarFrame(bytes, isTest = false) {
+    // Byte 0: 0x10 (0x11 = test) | Byte 1: seq | Byte 2: N | N*(cellIndex,dbz) | CRC8
     if (bytes.length < 4) return;
     const n = bytes[2];
     const expectedLen = 3 + 2 * n + 1;
@@ -577,14 +599,24 @@ import {
 
     state.sparseCells = cells;
     state.lastUpdateTs = Date.now();
-    $("#lastUpdate").textContent = `Radar updated ${new Date(state.lastUpdateTs).toLocaleTimeString()} · ${n} active cells`;
+    state.showingTest = isTest;
+    $("#lastUpdate").textContent = (isTest ? "TEST DATA - " : "") +
+      `Radar updated ${new Date(state.lastUpdateTs).toLocaleTimeString()} · ${n} active cells`;
+    $("#lastUpdate").classList.toggle("test", isTest);
 
-    recordRadarHistory(bytes[1], cells, state.lastUpdateTs);
+    // Live radar is back after a drill: drop the drill frames from the loop.
+    if (!isTest && state.radarHistory.some((h) => h.test)) {
+      if (state.playback.playing) stopPlayback();
+      state.radarHistory = state.radarHistory.filter((h) => !h.test);
+      saveLocal("loradar.radarHistory", state.radarHistory);
+    }
+    recordRadarHistory(bytes[1], cells, state.lastUpdateTs, isTest);
     drawRadarOverlay();
 
     if (severeDetected) {
       playAlertTone();
-      toast("⚠ Severe reflectivity detected nearby (55+ dBZ)");
+      toast(isTest ? "⚠ TEST - severe reflectivity drill (55+ dBZ)"
+                   : "⚠ Severe reflectivity detected nearby (55+ dBZ)");
     }
   }
 

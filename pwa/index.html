@@ -78,11 +78,12 @@
     border-radius: 10px; padding: 6px 8px; font-size: 11px; color: var(--muted);
     display: flex; align-items: center; gap: 8px;
   }
-  #playBtn {
+  #playBtn, #clearBtn {
     background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.15);
     color: var(--text); border-radius: 6px; padding: 5px 10px; font-size: 12px; cursor: pointer;
   }
-  #playBtn:disabled { opacity: 0.4; cursor: default; }
+  #playBtn:disabled, #clearBtn:disabled { opacity: 0.4; cursor: default; }
+  #lastUpdate.test { color: #ffd23c; border-color: #ffd23c; font-weight: 600; }
   #playBtn.playing { border-color: var(--accent); color: var(--accent); }
   #playDots { display: flex; gap: 4px; }
   #playDots span { width: 7px; height: 7px; border-radius: 50%; background: rgba(255,255,255,0.18); }
@@ -219,6 +220,7 @@
   <button id="playBtn" disabled title="Loop the last 3 radar updates to see storm movement">▶ Loop</button>
   <div id="playDots"><span></span><span></span><span></span></div>
   <span id="playLabel">No history yet</span>
+  <button id="clearBtn" disabled title="Clear loop history and any test data on screen">✕ Clear</button>
 </div>
 
 <div id="lastUpdate">No radar data yet</div>

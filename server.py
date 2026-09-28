@@ -57,6 +57,7 @@ GRID_SIZE = 16  # 16x16 sparse matrix
 
 FRAME_CONFIG = 0xCF
 FRAME_RADAR = 0x10
+FRAME_RADAR_TEST = 0x11  # same layout as 0x10; marks drill/test data
 
 # ---------------------------------------------------------------------------
 # CRC8 (polynomial 0x07, standard CRC-8/SMBUS-ish) - matches client decoder
@@ -484,12 +485,12 @@ def build_config_frame(cfg: Config) -> bytes:
     return bytes(body)
 
 
-def build_radar_frame(sparse: List[Tuple[int, int]]) -> bytes:
+def build_radar_frame(sparse: List[Tuple[int, int]], test: bool = False) -> bytes:
     """
     0x10 Sparse Radar Data Frame — up to 36 bytes total (3 fixed header
     bytes + up to 16 * 2-byte cell tuples + 1 CRC8 byte):
 
-      Byte 0        : 0x10 header
+      Byte 0        : 0x10 header (0x11 = test/drill data, same layout)
       Byte 1        : Sequence number (0-255, wraps)
       Byte 2        : Active tile count N (0-16)
       Bytes 3..3+2N : N * [cell_index (1B), dbz_level (1B)]
@@ -497,7 +498,7 @@ def build_radar_frame(sparse: List[Tuple[int, int]]) -> bytes:
     """
     n = min(len(sparse), 16)
     body = bytearray()
-    body.append(FRAME_RADAR)
+    body.append(FRAME_RADAR_TEST if test else FRAME_RADAR)
     body.append(next_seq())
     body.append(n)
     for cell_index, dbz in sparse[:n]:
@@ -1041,7 +1042,7 @@ def run_storm_test(place: str, hold_sec: int = 120, assume_yes: bool = False) ->
         return 1
 
     try:
-        dispatch_frames(cfg, [build_config_frame(cfg), build_radar_frame(cells)])
+        dispatch_frames(cfg, [build_config_frame(cfg), build_radar_frame(cells, test=True)])
         print(f"[{time.strftime('%H:%M:%S')}] Storm test broadcast sent.")
     except Exception as exc:
         print(f"Transmit failed: {exc}")
@@ -1128,7 +1129,7 @@ def run_replay_test(start: str, count: int = 3, step_min: int = 10, gap_sec: int
         local = t.astimezone().strftime("%Y-%m-%d %I:%M %p %Z")
         print(f"  {t:%Y-%m-%d %H:%MZ} ({local}): {len(sparse)} cell(s) sent, "
               f"peak {peak if sparse else '-'} dBZ")
-        frames.append(build_radar_frame(sparse))
+        frames.append(build_radar_frame(sparse, test=True))
     if peak_all == 0:
         print("  No echoes in your coverage area at those times - check the date/time.")
         return 1
@@ -1239,7 +1240,7 @@ def run_self_test(hold_sec: int = 60, transmit: bool = True) -> int:
 
     if transmit and node_ok and failures == 0:
         try:
-            dispatch_frames(cfg, [build_config_frame(cfg), build_radar_frame(build_test_pattern())])
+            dispatch_frames(cfg, [build_config_frame(cfg), build_radar_frame(build_test_pattern(), test=True)])
             check("Transmit test pattern", True, "diamond should now appear at the map center")
         except Exception as exc:
             check("Transmit test pattern", False, str(exc))
