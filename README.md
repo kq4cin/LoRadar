@@ -283,6 +283,14 @@ After setup, the app:
   to overlay a 16×16 color-coded reflectivity grid on the map.
 - Shows a pulsing blue "You Are Here" GPS marker.
 - Plays an audio alert when any cell reports ≥55 dBZ.
+- Keeps the last 3 radar updates (saved across app restarts). Tap
+  **▶ Loop** (bottom right) to animate them oldest → newest, so you can see
+  which way a storm is moving and whether it's strengthening. The label
+  shows each frame's time and age (e.g. `1/3 · 2:05 PM (-10m)`), and the
+  newest frame is held a little longer before the loop repeats. Tap
+  **■ Stop** to return to the live picture. New updates arriving during
+  playback join the loop automatically. History is cleared if the base
+  station's coverage area changes.
 
 Browser support notes: WebBluetooth and WebSerial are supported in
 Chrome/Edge (desktop and Android). iOS Safari supports neither API as of

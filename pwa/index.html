@@ -71,6 +71,25 @@
     border-radius: 10px; padding: 8px 12px; font-size: 11px; color: var(--muted);
   }
 
+  /* Radar playback loop */
+  #playback {
+    position: absolute; bottom: 52px; right: 14px; z-index: 900;
+    background: rgba(8,14,26,0.85); border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 10px; padding: 6px 8px; font-size: 11px; color: var(--muted);
+    display: flex; align-items: center; gap: 8px;
+  }
+  #playBtn {
+    background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.15);
+    color: var(--text); border-radius: 6px; padding: 5px 10px; font-size: 12px; cursor: pointer;
+  }
+  #playBtn:disabled { opacity: 0.4; cursor: default; }
+  #playBtn.playing { border-color: var(--accent); color: var(--accent); }
+  #playDots { display: flex; gap: 4px; }
+  #playDots span { width: 7px; height: 7px; border-radius: 50%; background: rgba(255,255,255,0.18); }
+  #playDots span.active { background: var(--accent); box-shadow: 0 0 6px var(--accent); }
+  #playLabel { min-width: 92px; }
+  #playLabel.historic { color: var(--accent); font-weight: 600; }
+
   /* Onboarding modal */
   #onboarding {
     position: fixed; inset: 0; z-index: 2000;
@@ -194,6 +213,12 @@
   <span class="swatch" style="background:#ff9a3c"></span><span>40-55</span>
   <span class="swatch" style="background:#ff3c3c"></span><span>55-65</span>
   <span class="swatch" style="background:#d43cff"></span><span>65+</span>
+</div>
+
+<div id="playback">
+  <button id="playBtn" disabled title="Loop the last 3 radar updates to see storm movement">▶ Loop</button>
+  <div id="playDots"><span></span><span></span><span></span></div>
+  <span id="playLabel">No history yet</span>
 </div>
 
 <div id="lastUpdate">No radar data yet</div>

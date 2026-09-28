@@ -37,6 +37,10 @@ import {
   const TILE_ZOOMS = [8, 9, 10, 11];
   const TILE_RADIUS_CELLS = 4; // tiles around center per zoom, in each direction
 
+  const HISTORY_SIZE = 3; // radar frames kept for the playback loop
+  const PLAYBACK_FRAME_MS = 900;
+  const PLAYBACK_LATEST_HOLD_MS = 1800; // linger on the newest frame before looping
+
   // ------------------------------------------------------------------
   // Small utilities
   // ------------------------------------------------------------------
@@ -250,6 +254,8 @@ import {
     stationConfig: null, // parsed from 0xCF: {stationId, centerLat, centerLon, cellScaleMiles, regionHash}
     sparseCells: [], // [{cellIndex, dbz}]
     lastUpdateTs: null,
+    radarHistory: [], // last HISTORY_SIZE frames: [{ts, seq, cells}], oldest first
+    playback: { playing: false, index: -1, timer: null },
     transport: null, // "bluetooth" | "serial"
     channel: 0, // MeshCore channel index radar frames are expected on
     mcConnection: null, // active meshcore.js Connection instance
@@ -305,7 +311,12 @@ import {
     if (!ctx || !state.map) return;
     ctx.clearRect(0, 0, state.radarCanvas.width, state.radarCanvas.height);
 
-    if (!state.stationConfig || state.sparseCells.length === 0) return;
+    if (!state.stationConfig) return;
+    const pb = state.playback;
+    const cellsToDraw = pb.playing && state.radarHistory[pb.index]
+      ? state.radarHistory[pb.index].cells
+      : state.sparseCells;
+    if (cellsToDraw.length === 0) return;
 
     const { centerLat, centerLon, cellScaleMiles } = state.stationConfig;
     const milesPerCell = cellScaleMiles || 3.1; // fallback ~50mi/16
@@ -317,7 +328,7 @@ import {
     const gridOriginLat = centerLat + (GRID_SIZE / 2) * degLatPerCell;
     const gridOriginLon = centerLon - (GRID_SIZE / 2) * degLonPerCell;
 
-    for (const cell of state.sparseCells) {
+    for (const cell of cellsToDraw) {
       const gx = cell.cellIndex % GRID_SIZE;
       const gy = Math.floor(cell.cellIndex / GRID_SIZE);
 
@@ -339,6 +350,100 @@ import {
       ctx.strokeStyle = "rgba(255,255,255,0.15)";
       ctx.strokeRect(x, y, w, h);
     }
+  }
+
+  // ------------------------------------------------------------------
+  // Radar playback loop (last HISTORY_SIZE frames)
+  // ------------------------------------------------------------------
+  function recordRadarHistory(seq, cells, ts) {
+    const last = state.radarHistory[state.radarHistory.length - 1];
+    // Mesh flooding can deliver the same message more than once; skip repeats.
+    if (last && last.seq === seq && JSON.stringify(last.cells) === JSON.stringify(cells)) return;
+    state.radarHistory.push({ ts, seq, cells });
+    while (state.radarHistory.length > HISTORY_SIZE) state.radarHistory.shift();
+    saveLocal("loradar.radarHistory", state.radarHistory);
+    if (state.playback.playing) {
+      // Keep looping; index may have shifted when the oldest frame dropped off.
+      state.playback.index = Math.min(state.playback.index, state.radarHistory.length - 1);
+    }
+    updatePlaybackUi();
+  }
+
+  function formatAge(ts) {
+    const mins = Math.round((Date.now() - ts) / 60000);
+    const clock = new Date(ts).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    return mins <= 0 ? `${clock} (now)` : `${clock} (-${mins}m)`;
+  }
+
+  function updatePlaybackUi() {
+    const hist = state.radarHistory;
+    const pb = state.playback;
+    const btn = $("#playBtn");
+    btn.disabled = hist.length < 2;
+    btn.textContent = pb.playing ? "■ Stop" : "▶ Loop";
+    btn.classList.toggle("playing", pb.playing);
+
+    $all("#playDots span").forEach((dot, i) => {
+      const hasFrame = i < hist.length;
+      dot.style.visibility = hasFrame ? "visible" : "hidden";
+      const activeIdx = pb.playing ? pb.index : hist.length - 1;
+      dot.classList.toggle("active", hasFrame && i === activeIdx);
+    });
+
+    const label = $("#playLabel");
+    if (hist.length === 0) {
+      label.textContent = "No history yet";
+      label.classList.remove("historic");
+    } else if (pb.playing && hist[pb.index]) {
+      label.textContent = `${pb.index + 1}/${hist.length} · ${formatAge(hist[pb.index].ts)}`;
+      label.classList.toggle("historic", pb.index < hist.length - 1);
+    } else {
+      label.textContent = hist.length < 2
+        ? "Need 2+ updates"
+        : `${hist.length} frames · ${formatAge(hist[0].ts).split(" (")[0]}–now`;
+      label.classList.remove("historic");
+    }
+  }
+
+  function playbackStep() {
+    const pb = state.playback;
+    const hist = state.radarHistory;
+    if (!pb.playing || hist.length < 2) { stopPlayback(); return; }
+    pb.index = (pb.index + 1) % hist.length;
+    drawRadarOverlay();
+    updatePlaybackUi();
+    const delay = pb.index === hist.length - 1 ? PLAYBACK_LATEST_HOLD_MS : PLAYBACK_FRAME_MS;
+    pb.timer = setTimeout(playbackStep, delay);
+  }
+
+  function startPlayback() {
+    if (state.radarHistory.length < 2) return;
+    const pb = state.playback;
+    pb.playing = true;
+    pb.index = -1; // playbackStep advances to the oldest frame first
+    playbackStep();
+  }
+
+  function stopPlayback() {
+    const pb = state.playback;
+    clearTimeout(pb.timer);
+    pb.playing = false;
+    pb.index = -1;
+    pb.timer = null;
+    drawRadarOverlay(); // back to the live (latest) frame
+    updatePlaybackUi();
+  }
+
+  function initPlayback() {
+    const saved = loadLocal("loradar.radarHistory", []);
+    if (Array.isArray(saved) && state.radarHistory.length === 0) state.radarHistory = saved.slice(-HISTORY_SIZE);
+    $("#playBtn").addEventListener("click", () => {
+      if (state.playback.playing) stopPlayback();
+      else startPlayback();
+    });
+    // Keep the relative "-Nm" ages fresh while idle.
+    setInterval(() => { if (!state.playback.playing) updatePlaybackUi(); }, 30000);
+    updatePlaybackUi();
   }
 
   // ------------------------------------------------------------------
@@ -414,6 +519,7 @@ import {
     const cellScaleMiles = bytes[9];
     const regionHash = bytes[10];
 
+    const prev = state.stationConfig;
     state.stationConfig = {
       stationId,
       centerLat: latScaled / 100,
@@ -422,6 +528,17 @@ import {
       regionHash,
     };
     saveLocal("loradar.stationConfig", state.stationConfig);
+
+    // History frames are only meaningful on the same grid; drop them if the
+    // coverage area changed so playback never mixes two different maps.
+    const c = state.stationConfig;
+    if (prev && (prev.centerLat !== c.centerLat || prev.centerLon !== c.centerLon ||
+                 prev.cellScaleMiles !== c.cellScaleMiles)) {
+      if (state.playback.playing) stopPlayback();
+      state.radarHistory = [];
+      saveLocal("loradar.radarHistory", []);
+      updatePlaybackUi();
+    }
 
     $("#regionLabel").textContent = `${stationId || "Unknown"} · auto-configured`;
 
@@ -462,6 +579,7 @@ import {
     state.lastUpdateTs = Date.now();
     $("#lastUpdate").textContent = `Radar updated ${new Date(state.lastUpdateTs).toLocaleTimeString()} · ${n} active cells`;
 
+    recordRadarHistory(bytes[1], cells, state.lastUpdateTs);
     drawRadarOverlay();
 
     if (severeDetected) {
@@ -1262,6 +1380,7 @@ import {
     }
 
     initMap(lat, lon);
+    initPlayback();
     startGpsWatch();
 
     if (savedLocation) updateGpsMarker(savedLocation.lat, savedLocation.lon);
