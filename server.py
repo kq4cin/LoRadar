@@ -85,7 +85,10 @@ class Config:
     center_lat: float = 0.0
     center_lon: float = 0.0
     span_miles: float = 50.0
+    # Fast interval, used while an NWS alert is active for the location.
     update_interval_sec: int = 300
+    # Slow interval, used when no alerts are active (quiet weather).
+    idle_interval_sec: int = 1800
 
     # How `meshcore-cli` should connect to the local companion-radio node.
     connection_mode: str = "serial"  # "serial" | "ble" | "tcp"
@@ -544,7 +547,14 @@ def run_setup_wizard() -> None:
         region_name = prompt("Region display name", cfg.region_name or "My Region")
 
     span_miles = float(prompt("Regional bounding box size in miles", str(cfg.span_miles or 50)))
-    update_interval = int(prompt("Update interval (seconds)", str(cfg.update_interval_sec or 300)))
+    print("\n  Updates run on two speeds to save mesh airtime:")
+    print("    - Fast interval while an NWS alert is active for your location")
+    print("    - Slow interval when the weather is quiet (no active alerts)")
+    update_interval = int(prompt("Fast update interval during alerts (seconds)", str(cfg.update_interval_sec or 300)))
+    idle_interval = int(prompt("Slow update interval when quiet (seconds)", str(cfg.idle_interval_sec or 1800)))
+    if idle_interval < update_interval:
+        print("  ! Slow interval is shorter than fast interval; using the fast interval for both.")
+        idle_interval = update_interval
 
     print("\nStep 3: MeshCore Connection")
     print("  1) USB Serial — connect via cable to the companion-radio device")
@@ -632,6 +642,7 @@ def run_setup_wizard() -> None:
         center_lon=round(lon, 4),
         span_miles=span_miles,
         update_interval_sec=update_interval,
+        idle_interval_sec=idle_interval,
         connection_mode=connection_mode,
         serial_port=serial_port,
         baud_rate=baud_rate,
@@ -652,38 +663,54 @@ def run_setup_wizard() -> None:
 # Main loop
 # ---------------------------------------------------------------------------
 
-def build_frames_for_cycle(cfg: Config) -> List[bytes]:
+def build_frames_for_cycle(cfg: Config) -> Tuple[List[bytes], bool]:
+    """Return (frames, weather_active). weather_active is True when the grid
+    contains any echoes, i.e. an NWS alert is active for the location."""
     grid = fetch_radar_reflectivity_grid(cfg)
     sparse = downsample_to_sparse(grid)
     radar_frame = build_radar_frame(sparse)
-    return [radar_frame]
+    return [radar_frame], bool(sparse)
 
 
 def run_loop(cfg: Config) -> None:
+    fast = max(1, cfg.update_interval_sec)
+    slow = max(fast, cfg.idle_interval_sec or fast)
     print(f"Starting LoRadar broadcast loop for {cfg.region_name} ({cfg.station_id})")
     chan_label = f"{cfg.channel} ({cfg.channel_name})" if cfg.channel_name else str(cfg.channel)
-    print(f"Connection: {cfg.connection_mode}   Channel: {chan_label}   Interval: {cfg.update_interval_sec}s")
+    print(f"Connection: {cfg.connection_mode}   Channel: {chan_label}   "
+          f"Interval: {fast}s during alerts / {slow}s when quiet")
     config_frame = build_config_frame(cfg)
     last_config_broadcast = 0.0
+    was_active: Optional[bool] = None
 
     while True:
+        interval = slow
         try:
             now = time.time()
             frames = []
-            # Re-broadcast the config frame periodically (every ~10 cycles)
-            # so late-joining clients still receive station metadata.
-            if now - last_config_broadcast > max(cfg.update_interval_sec * 10, 1800):
+            # Re-broadcast the config frame periodically so late-joining
+            # clients still receive station metadata.
+            if now - last_config_broadcast > max(fast * 10, 1800):
                 frames.append(config_frame)
                 last_config_broadcast = now
 
-            frames += build_frames_for_cycle(cfg)
+            radar_frames, active = build_frames_for_cycle(cfg)
+            frames += radar_frames
+            interval = fast if active else slow
+            if was_active is not None and active != was_active:
+                state = "ALERT ACTIVE - switching to fast" if active else "All clear - switching to slow"
+                print(f"[{time.strftime('%H:%M:%S')}] {state} updates ({interval}s)")
+            was_active = active
+
             dispatch_frames(cfg, frames)
             print(f"[{time.strftime('%H:%M:%S')}] Sent {len(frames)} frame(s), "
-                  f"radar payload {len(frames[-1])} bytes")
+                  f"radar payload {len(frames[-1])} bytes, next update in {interval}s")
         except Exception as exc:
+            # Retry sooner after an error in case weather is active.
+            interval = fast
             print(f"[{time.strftime('%H:%M:%S')}] ERROR: {exc}", file=sys.stderr)
 
-        time.sleep(cfg.update_interval_sec)
+        time.sleep(interval)
 
 
 def main() -> None:
@@ -715,7 +742,7 @@ def main() -> None:
 
     if args.once:
         cfg_frame = build_config_frame(cfg)
-        frames = [cfg_frame] + build_frames_for_cycle(cfg)
+        frames = [cfg_frame] + build_frames_for_cycle(cfg)[0]
         dispatch_frames(cfg, frames)
         print(f"Sent {len(frames)} frame(s).")
         return
