@@ -805,17 +805,116 @@ def run_loop(cfg: Config) -> None:
         time.sleep(interval)
 
 
+def build_test_pattern() -> List[Tuple[int, int]]:
+    """A small diamond of moderate echoes around the grid center, kept below
+    55 dBZ so it doesn't trigger the client's severe-weather alarm."""
+    c = GRID_SIZE // 2
+    cells = [(c, c, 45)]
+    cells += [(c + dx, c + dy, 35) for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1))]
+    cells += [(c + dx, c + dy, 25) for dx, dy in ((2, 0), (-2, 0), (0, 2), (0, -2))]
+    return [(y * GRID_SIZE + x, dbz) for x, y, dbz in cells]
+
+
+def run_self_test(hold_sec: int = 60, transmit: bool = True) -> int:
+    """Health-check every stage of the pipeline, optionally broadcast a
+    visible test pattern, then restore the real radar picture. Returns a
+    process exit code: 0 = all checks passed, 1 = at least one failed."""
+    failures = 0
+
+    def check(name: str, ok: bool, detail: str = "") -> bool:
+        nonlocal failures
+        if not ok:
+            failures += 1
+        print(f"  [{'PASS' if ok else 'FAIL'}] {name}{(' - ' + detail) if detail else ''}")
+        return ok
+
+    print(f"LoRadar self-test  {time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    try:
+        cfg = Config.load()
+        check("Config file", True, f"{cfg.region_name} ({cfg.station_id}), channel {cfg.channel}")
+    except Exception as exc:
+        check("Config file", False, str(exc))
+        print("\nRESULT: FAIL (run `python3 server.py --setup` first)")
+        return 1
+
+    try:
+        http_get_json(f"https://api.weather.gov/alerts/active?point={cfg.center_lat:.4f},{cfg.center_lon:.4f}")
+        check("NWS api.weather.gov reachable", True)
+    except Exception as exc:
+        check("NWS api.weather.gov reachable", False, str(exc))
+
+    try:
+        sparse = downsample_to_sparse(fetch_radar_reflectivity_grid(cfg))
+        frame = build_radar_frame(sparse)
+        check("Radar frame build", True,
+              f"{len(sparse)} active cell(s), {len(frame)} bytes"
+              + (" - weather alert active" if sparse else " - all clear"))
+    except Exception as exc:
+        sparse = []
+        check("Radar frame build", False, str(exc))
+
+    cli = _cli_path(cfg)
+    import shutil
+    cli_ok = os.path.isfile(cli) or shutil.which(cli) is not None
+    check("meshcore-cli found", cli_ok, cli)
+
+    node = probe_node(cfg) if cli_ok else None
+    node_ok = check("MeshCore radio responding", node is not None,
+                    f"'{node}' via {cfg.connection_mode}" if node else f"no reply via {cfg.connection_mode}")
+
+    if node_ok:
+        channels = discover_channels(cfg)
+        if channels is None:
+            check("Broadcast channel exists", True, f"channel {cfg.channel} (could not list channels to verify)")
+        else:
+            match = next((n for i, n in channels if i == cfg.channel), None)
+            check("Broadcast channel exists", match is not None,
+                  f"channel {cfg.channel} = '{match}'" if match is not None
+                  else f"channel {cfg.channel} not configured on node")
+
+    if transmit and node_ok and failures == 0:
+        try:
+            dispatch_frames(cfg, [build_config_frame(cfg), build_radar_frame(build_test_pattern())])
+            check("Transmit test pattern", True, "diamond should now appear at the map center")
+        except Exception as exc:
+            check("Transmit test pattern", False, str(exc))
+        else:
+            if hold_sec > 0:
+                print(f"  ... holding test pattern for {hold_sec}s, then restoring the live radar picture")
+                time.sleep(hold_sec)
+            try:
+                dispatch_frames(cfg, [build_radar_frame(sparse)])
+                check("Restore live radar", True, f"{len(sparse)} active cell(s)")
+            except Exception as exc:
+                check("Restore live radar", False, str(exc))
+    elif transmit:
+        print("  [SKIP] Transmit test pattern - fix the failures above first")
+
+    print(f"\nRESULT: {'PASS' if failures == 0 else f'FAIL ({failures} check(s) failed)'}")
+    return 0 if failures == 0 else 1
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="LoRadar — Off-Grid Weather Radar Server")
     parser.add_argument("--setup", action="store_true", help="Run interactive setup wizard")
     parser.add_argument("--run", action="store_true", help="Start the continuous fetch/broadcast loop")
     parser.add_argument("--once", action="store_true", help="Fetch + send a single frame, then exit")
     parser.add_argument("--dump", action="store_true", help="Print packed frames as hex without sending")
+    parser.add_argument("--test", action="store_true",
+                        help="Run health checks and broadcast a visible test pattern (exit code 0 = pass)")
+    parser.add_argument("--test-hold", type=int, default=60, metavar="SEC",
+                        help="Seconds to show the test pattern before restoring live radar (default 60)")
+    parser.add_argument("--no-transmit", action="store_true",
+                        help="With --test: run health checks only, don't send anything over the air")
     args = parser.parse_args()
 
     if args.setup:
         run_setup_wizard()
         return
+
+    if args.test:
+        sys.exit(run_self_test(hold_sec=max(0, args.test_hold), transmit=not args.no_transmit))
 
     if not any([args.run, args.once, args.dump]):
         parser.print_help()

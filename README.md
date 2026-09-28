@@ -140,6 +140,34 @@ python3 server.py --dump   # print packed 0xCF/0x10 frames as hex, no serial wri
 python3 server.py --once   # send a single update cycle then exit
 ```
 
+### Testing the system
+
+Run a self-test any time to confirm the whole chain works:
+
+```bash
+python3 server.py --test               # health checks + visible test pattern
+python3 server.py --test --no-transmit # health checks only, nothing sent over the air
+python3 server.py --test --test-hold 120  # keep the test pattern on the map for 2 minutes
+```
+
+`--test` checks the config file, NWS connectivity, radar frame building,
+meshcore-cli, the radio connection, and the broadcast channel, printing
+PASS/FAIL for each. If everything passes it broadcasts a small diamond of
+echoes at the center of the map (below the 55 dBZ severe-alarm threshold),
+so anyone watching the LoRadar app can confirm reception, then restores the
+live radar picture after `--test-hold` seconds (default 60).
+
+It exits with code `0` on pass and `1` on failure, so it can be scheduled.
+For example, a weekly Sunday-noon test via `crontab -e`:
+
+```cron
+0 12 * * 0 cd $HOME/LoRadar && $HOME/.venvs/meshcore-cli/bin/python server.py --test >> $HOME/loradar-test.log 2>&1
+```
+
+Note: over USB serial, only one program can talk to the radio at a time. If
+`--run` happens to be sending at the same moment, a `--test` step may fail;
+just re-run it.
+
 ### Packet formats
 
 - **`0xCF` Config Frame (12 bytes)**: station ID, center lat/lon (scaled
