@@ -815,6 +815,116 @@ def build_test_pattern() -> List[Tuple[int, int]]:
     return [(y * GRID_SIZE + x, dbz) for x, y, dbz in cells]
 
 
+# Classic tornadic supercell ("hook echo") as (dx, dy, dBZ) offsets in grid
+# cells from the tornado/mesocyclone position. +dx = east, +dy = south (grid
+# rows run north to south). The intense core sits NE of the hook, with the
+# forward-flank precipitation trailing further NE, as for a storm moving NE.
+SUPERCELL_TEMPLATE: List[Tuple[int, int, int]] = [
+    (0, 0, 60),                                   # tornado / debris signature
+    (-1, 0, 55), (-1, 1, 45), (0, 1, 35),         # hook wrapping around the mesocyclone
+    (1, -1, 70), (1, 0, 65), (0, -1, 65), (2, -1, 60),  # hail core
+    (2, 0, 45), (3, -1, 40),                      # rear of core
+    (2, -2, 55), (1, -2, 50), (3, -2, 45),        # forward flank
+    (2, -3, 40), (3, -3, 35), (4, -3, 25),        # anvil-side light rain
+]
+
+
+def storm_grid_position(cfg: Config, lat: float, lon: float) -> Tuple[int, int, float]:
+    """Map a lat/lon to (gx, gy) grid cell using the same geometry the PWA
+    uses to draw cells, so the storm lands exactly on the named place.
+    Also returns the distance in miles from the coverage center."""
+    miles_per_cell = max(1, round(cfg.span_miles / GRID_SIZE))
+    dx_miles = (lon - cfg.center_lon) * 69.172 * math.cos(math.radians(cfg.center_lat))
+    dy_miles = (lat - cfg.center_lat) * 69.0
+    gx = math.floor(GRID_SIZE / 2 + dx_miles / miles_per_cell)
+    gy = math.floor(GRID_SIZE / 2 - dy_miles / miles_per_cell)
+    return gx, gy, haversine_miles(cfg.center_lat, cfg.center_lon, lat, lon)
+
+
+def build_supercell_pattern(gx: int, gy: int) -> List[Tuple[int, int]]:
+    """Place SUPERCELL_TEMPLATE with its tornado at (gx, gy), clipping any
+    cells that fall off the edge of the 16x16 grid."""
+    cells = []
+    for dx, dy, dbz in SUPERCELL_TEMPLATE:
+        x, y = gx + dx, gy + dy
+        if 0 <= x < GRID_SIZE and 0 <= y < GRID_SIZE:
+            cells.append((y * GRID_SIZE + x, dbz))
+    cells.sort(key=lambda t: t[1], reverse=True)
+    return cells[:16]
+
+
+def resolve_storm_location(cfg: Config, place: str) -> Tuple[float, float, str]:
+    """Resolve 'center', 'lat,lon', a ZIP, or a town name. Bare town names
+    (no state) get the station's state appended, so 'Carthage' finds
+    Carthage, TN rather than some other Carthage."""
+    p = place.strip()
+    if p.lower() in ("", "center", "centre"):
+        return cfg.center_lat, cfg.center_lon, cfg.region_name or "coverage center"
+    parts = [s.strip() for s in p.split(",")]
+    if len(parts) == 2:
+        try:
+            return float(parts[0]), float(parts[1]), p
+        except ValueError:
+            pass
+    query = p
+    if "," not in p and not p.isdigit() and "," in (cfg.region_name or ""):
+        query = f"{p}, {cfg.region_name.rsplit(',', 1)[1].strip()}"
+    lat, lon = geocode_zip_or_city(query)
+    return lat, lon, query
+
+
+def run_storm_test(place: str, hold_sec: int = 120, assume_yes: bool = False) -> int:
+    """Broadcast a simulated tornadic supercell centered on a named place,
+    hold it, then restore the live radar picture. Returns an exit code."""
+    cfg = Config.load()
+    try:
+        lat, lon, label = resolve_storm_location(cfg, place)
+    except Exception as exc:
+        print(f"Could not locate '{place}': {exc}")
+        return 1
+
+    gx, gy, dist = storm_grid_position(cfg, lat, lon)
+    if not (0 <= gx < GRID_SIZE and 0 <= gy < GRID_SIZE):
+        print(f"'{label}' is {dist:.0f} mi from {cfg.region_name}, outside the "
+              f"{cfg.span_miles:.0f}-mile coverage box. Pick a closer place or re-run --setup with a larger box.")
+        return 1
+
+    cells = build_supercell_pattern(gx, gy)
+    print(f"Simulated tornadic supercell over {label} ({lat:.4f}, {lon:.4f})")
+    print(f"  {dist:.1f} mi from coverage center, grid cell ({gx}, {gy}), "
+          f"{len(cells)}/{len(SUPERCELL_TEMPLATE)} cells on map, peak 70 dBZ")
+    if len(cells) < len(SUPERCELL_TEMPLATE):
+        print("  (part of the storm falls off the edge of the coverage box)")
+    print("\n  ! This WILL trigger the severe-weather alarm on every LoRadar client")
+    print(f"    listening on channel {cfg.channel} ({cfg.channel_name}). Consider announcing the test first.")
+    if not assume_yes and prompt("Type YES to broadcast", "").strip().upper() != "YES":
+        print("Cancelled - nothing sent.")
+        return 1
+
+    try:
+        dispatch_frames(cfg, [build_config_frame(cfg), build_radar_frame(cells)])
+        print(f"[{time.strftime('%H:%M:%S')}] Storm test broadcast sent.")
+    except Exception as exc:
+        print(f"Transmit failed: {exc}")
+        return 1
+
+    if hold_sec > 0:
+        print(f"  ... holding for {hold_sec}s, then restoring the live radar picture (Ctrl+C to restore now)")
+        try:
+            time.sleep(hold_sec)
+        except KeyboardInterrupt:
+            print()
+
+    try:
+        sparse = downsample_to_sparse(fetch_radar_reflectivity_grid(cfg))
+        dispatch_frames(cfg, [build_radar_frame(sparse)])
+        print(f"[{time.strftime('%H:%M:%S')}] Live radar restored ({len(sparse)} active cell(s)).")
+    except Exception as exc:
+        print(f"Restore failed: {exc} - run `python3 server.py --once` to clear the test storm.")
+        return 1
+    return 0
+
+
 def run_self_test(hold_sec: int = 60, transmit: bool = True) -> int:
     """Health-check every stage of the pipeline, optionally broadcast a
     visible test pattern, then restore the real radar picture. Returns a
@@ -903,18 +1013,28 @@ def main() -> None:
     parser.add_argument("--dump", action="store_true", help="Print packed frames as hex without sending")
     parser.add_argument("--test", action="store_true",
                         help="Run health checks and broadcast a visible test pattern (exit code 0 = pass)")
-    parser.add_argument("--test-hold", type=int, default=60, metavar="SEC",
-                        help="Seconds to show the test pattern before restoring live radar (default 60)")
+    parser.add_argument("--test-hold", type=int, default=None, metavar="SEC",
+                        help="Seconds to show a test pattern before restoring live radar "
+                             "(default 60 for --test, 120 for --test-storm)")
     parser.add_argument("--no-transmit", action="store_true",
                         help="With --test: run health checks only, don't send anything over the air")
+    parser.add_argument("--test-storm", nargs="?", const="center", metavar="PLACE",
+                        help="Broadcast a simulated tornadic supercell over PLACE (town, ZIP, 'lat,lon', "
+                             "or omit for the coverage center), then restore live radar")
+    parser.add_argument("--yes", action="store_true", help="With --test-storm: skip the confirmation prompt")
     args = parser.parse_args()
 
     if args.setup:
         run_setup_wizard()
         return
 
+    if args.test_storm is not None:
+        hold = 120 if args.test_hold is None else args.test_hold
+        sys.exit(run_storm_test(args.test_storm, hold_sec=max(0, hold), assume_yes=args.yes))
+
     if args.test:
-        sys.exit(run_self_test(hold_sec=max(0, args.test_hold), transmit=not args.no_transmit))
+        sys.exit(run_self_test(hold_sec=max(0, 60 if args.test_hold is None else args.test_hold),
+                               transmit=not args.no_transmit))
 
     if not any([args.run, args.once, args.dump]):
         parser.print_help()

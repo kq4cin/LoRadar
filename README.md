@@ -168,6 +168,30 @@ Note: over USB serial, only one program can talk to the radio at a time. If
 `--run` happens to be sending at the same moment, a `--test` step may fail;
 just re-run it.
 
+### Simulated tornado drill
+
+`--test-storm` broadcasts a realistic tornadic supercell (hook echo, 70 dBZ
+hail core, forward-flank rain trailing northeast) centered on any place in
+your coverage box, then restores live radar after 2 minutes:
+
+```bash
+python3 server.py --test-storm Cookeville        # town in your station's state
+python3 server.py --test-storm "Carthage"        # bare names get your state added
+python3 server.py --test-storm "Crossville, TN"  # or give the state explicitly
+python3 server.py --test-storm 38501             # ZIP code
+python3 server.py --test-storm 36.25,-85.95      # exact lat,lon
+python3 server.py --test-storm                   # center of coverage
+python3 server.py --test-storm Carthage --test-hold 300   # hold for 5 minutes
+```
+
+The tornado (hook) is placed on the named location. Places outside the
+coverage box are rejected; places near the edge are partially clipped.
+
+**This triggers the severe-weather alarm on every LoRadar client on your
+channel**, so the command asks you to type `YES` first (add `--yes` to
+skip). Announce drills to your mesh users before running one. Press Ctrl+C
+during the hold to restore live radar immediately.
+
 ### Packet formats
 
 - **`0xCF` Config Frame (12 bytes)**: station ID, center lat/lon (scaled
