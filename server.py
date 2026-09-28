@@ -217,6 +217,7 @@ import urllib.parse  # noqa: E402  (kept near usage above for clarity)
 # mosaic PNG itself and index -> dBZ is documented by IEM as
 # dBZ = index * 0.5 - 32.5 (index 0 = no data).
 IEM_WMS_URL = "https://mesonet.agron.iastate.edu/cgi-bin/wms/nexrad/n0q.cgi"
+IEM_WMS_T_URL = "https://mesonet.agron.iastate.edu/cgi-bin/wms/nexrad/n0q-t.cgi"  # archive (2011+)
 IEM_N0Q_PNG = "https://mesonet.agron.iastate.edu/data/gis/images/4326/USCOMP/n0q_0.png"
 IEM_N0Q_META = "https://mesonet.agron.iastate.edu/data/gis/images/4326/USCOMP/n0q_0.json"
 N0Q_DEG_PER_PIXEL = 0.005
@@ -339,15 +340,17 @@ def grid_geometry(cfg: Config) -> Tuple[float, float, float, float]:
     return lat, lon, miles_per_cell / 69.0, miles_per_cell / (69.172 * math.cos(math.radians(lat)))
 
 
-def fetch_radar_reflectivity_grid(cfg: Config) -> List[List[Optional[float]]]:
-    """Fetch live NEXRAD mosaic reflectivity for the coverage box and reduce
-    it to a GRID_SIZE x GRID_SIZE grid of dBZ (None = no echo >= DBZ_MIN).
-    Each cell takes the strongest reflectivity inside it (see
-    CELL_MIN_PIXELS). Raises on failure or stale data rather than reporting
-    a false all-clear."""
-    age = radar_data_age_sec()
-    if age is not None and age > RADAR_MAX_AGE_SEC:
-        raise RuntimeError(f"radar mosaic is stale ({age / 60:.0f} min old)")
+def fetch_radar_reflectivity_grid(cfg: Config, when=None) -> List[List[Optional[float]]]:
+    """Fetch NEXRAD mosaic reflectivity for the coverage box and reduce it to
+    a GRID_SIZE x GRID_SIZE grid of dBZ (None = no echo >= DBZ_MIN). Each
+    cell takes the strongest reflectivity inside it (see CELL_MIN_PIXELS).
+    `when` (an aware UTC datetime on a 5-minute boundary) fetches that
+    moment from IEM's archive instead of the live mosaic. Raises on failure
+    or stale data rather than reporting a false all-clear."""
+    if when is None:
+        age = radar_data_age_sec()
+        if age is not None and age > RADAR_MAX_AGE_SEC:
+            raise RuntimeError(f"radar mosaic is stale ({age / 60:.0f} min old)")
 
     lut = _load_n0q_palette()
     lat, lon, dlat, dlon = grid_geometry(cfg)
@@ -358,10 +361,15 @@ def fetch_radar_reflectivity_grid(cfg: Config) -> List[List[Optional[float]]]:
     px_per_cell_y = max(4, math.ceil(dlat / N0Q_DEG_PER_PIXEL))
     width, height = px_per_cell_x * GRID_SIZE, px_per_cell_y * GRID_SIZE
 
+    if when is None:
+        base, layer, time_arg = IEM_WMS_URL, "nexrad-n0q", ""
+    else:
+        base, layer = IEM_WMS_T_URL, "nexrad-n0q-wmst"
+        time_arg = "&TIME=" + when.strftime("%Y-%m-%dT%H:%M:00Z")
     url = (
-        f"{IEM_WMS_URL}?SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap&LAYERS=nexrad-n0q&STYLES="
+        f"{base}?SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap&LAYERS={layer}&STYLES="
         f"&SRS=EPSG:4326&BBOX={west:.5f},{south:.5f},{east:.5f},{north:.5f}"
-        f"&WIDTH={width}&HEIGHT={height}&FORMAT=image/png&TRANSPARENT=TRUE"
+        f"&WIDTH={width}&HEIGHT={height}&FORMAT=image/png&TRANSPARENT=TRUE{time_arg}"
     )
     data = _http_get_bytes(url, timeout=45)
     if not data.startswith(b"\x89PNG"):
@@ -1056,6 +1064,114 @@ def run_storm_test(place: str, hold_sec: int = 120, assume_yes: bool = False) ->
     return 0
 
 
+REPLAY_ARCHIVE_START = (2011, 1, 1)  # IEM's N0Q mosaic archive begins late 2010
+
+
+def parse_replay_time(text: str):
+    """Parse a replay start time. A trailing 'Z' or '+/-HH:MM' offset is
+    honored; otherwise the time is taken as this computer's local time.
+    Rounds down to the mosaic's 5-minute steps and returns aware UTC."""
+    from datetime import datetime, timezone
+
+    s = text.strip().replace(" ", "T")
+    if s.endswith(("Z", "z")):
+        s = s[:-1] + "+00:00"
+    dt = None
+    for fmt in ("%Y-%m-%dT%H:%M%z", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            break
+        except ValueError:
+            continue
+    if dt is None:
+        raise ValueError(f"can't read time '{text}' - use e.g. 2020-03-03T01:45 (local) or 2020-03-03T07:45Z (UTC)")
+    if dt.tzinfo is None:
+        dt = dt.astimezone()  # naive -> this machine's local time zone
+    dt = dt.astimezone(timezone.utc)
+    return dt.replace(minute=dt.minute - dt.minute % 5, second=0, microsecond=0)
+
+
+def run_replay_test(start: str, count: int = 3, step_min: int = 10, gap_sec: int = 20,
+                    hold_sec: int = 120, assume_yes: bool = False) -> int:
+    """Rebroadcast real archived NEXRAD radar for a past event, `count`
+    frames `step_min` minutes apart (sent `gap_sec` apart so clients can
+    loop them with the playback control), hold, then restore live radar."""
+    from datetime import datetime, timedelta, timezone
+
+    cfg = Config.load()
+    try:
+        t0 = parse_replay_time(start)
+    except ValueError as exc:
+        print(exc)
+        return 1
+    count = max(1, min(count, 12))
+    times = [t0 + timedelta(minutes=max(5, step_min) * i) for i in range(count)]
+    now = datetime.now(timezone.utc)
+    if t0 < datetime(*REPLAY_ARCHIVE_START, tzinfo=timezone.utc):
+        print("The radar archive starts in 2011 - pick a later date.")
+        return 1
+    if times[-1] > now - timedelta(minutes=10):
+        print("Replay times must be in the past (at least 10 minutes ago).")
+        return 1
+
+    print(f"Replaying archived NEXRAD radar for {cfg.region_name} ({cfg.station_id} area)")
+    frames: List[bytes] = []
+    peak_all = 0
+    for t in times:
+        try:
+            sparse = downsample_to_sparse(fetch_radar_reflectivity_grid(cfg, when=t))
+        except Exception as exc:
+            print(f"  Could not fetch radar for {t:%Y-%m-%d %H:%MZ}: {exc}")
+            return 1
+        peak = max((d for _, d in sparse), default=0)
+        peak_all = max(peak_all, peak)
+        local = t.astimezone().strftime("%Y-%m-%d %I:%M %p %Z")
+        print(f"  {t:%Y-%m-%d %H:%MZ} ({local}): {len(sparse)} cell(s) sent, "
+              f"peak {peak if sparse else '-'} dBZ")
+        frames.append(build_radar_frame(sparse))
+    if peak_all == 0:
+        print("  No echoes in your coverage area at those times - check the date/time.")
+        return 1
+
+    if peak_all >= 55:
+        print("\n  ! This WILL trigger the severe-weather alarm on every LoRadar client")
+    else:
+        print("\n  ! This replaces the live radar picture on every LoRadar client")
+    print(f"    listening on channel {cfg.channel} ({cfg.channel_name}). Consider announcing the test first.")
+    if not assume_yes and prompt("Type YES to broadcast", "").strip().upper() != "YES":
+        print("Cancelled - nothing sent.")
+        return 1
+
+    try:
+        for i, frame in enumerate(frames):
+            if i:
+                time.sleep(gap_sec)
+            dispatch_frames(cfg, ([build_config_frame(cfg)] if i == 0 else []) + [frame])
+            print(f"[{time.strftime('%H:%M:%S')}] Sent replay frame {i + 1}/{len(frames)} "
+                  f"({times[i]:%H:%MZ})")
+    except KeyboardInterrupt:
+        print()
+    except Exception as exc:
+        print(f"Transmit failed: {exc}")
+        return 1
+
+    if hold_sec > 0:
+        print(f"  ... holding for {hold_sec}s, then restoring the live radar picture (Ctrl+C to restore now)")
+        try:
+            time.sleep(hold_sec)
+        except KeyboardInterrupt:
+            print()
+
+    try:
+        sparse = downsample_to_sparse(fetch_radar_reflectivity_grid(cfg))
+        dispatch_frames(cfg, [build_radar_frame(sparse)])
+        print(f"[{time.strftime('%H:%M:%S')}] Live radar restored ({len(sparse)} active cell(s)).")
+    except Exception as exc:
+        print(f"Restore failed: {exc} - run `python3 server.py --once` to clear the replay.")
+        return 1
+    return 0
+
+
 def run_self_test(hold_sec: int = 60, transmit: bool = True) -> int:
     """Health-check every stage of the pipeline, optionally broadcast a
     visible test pattern, then restore the real radar picture. Returns a
@@ -1153,18 +1269,34 @@ def main() -> None:
                         help="Run health checks and broadcast a visible test pattern (exit code 0 = pass)")
     parser.add_argument("--test-hold", type=int, default=None, metavar="SEC",
                         help="Seconds to show a test pattern before restoring live radar "
-                             "(default 60 for --test, 120 for --test-storm)")
+                             "(default 60 for --test, 120 for --test-storm/--test-replay)")
     parser.add_argument("--no-transmit", action="store_true",
                         help="With --test: run health checks only, don't send anything over the air")
     parser.add_argument("--test-storm", nargs="?", const="center", metavar="PLACE",
                         help="Broadcast a simulated tornadic supercell over PLACE (town, ZIP, 'lat,lon', "
                              "or omit for the coverage center), then restore live radar")
-    parser.add_argument("--yes", action="store_true", help="With --test-storm: skip the confirmation prompt")
+    parser.add_argument("--yes", action="store_true",
+                        help="With --test-storm/--test-replay: skip the confirmation prompt")
+    parser.add_argument("--test-replay", metavar="TIME",
+                        help="Rebroadcast real archived radar from a past event starting at TIME "
+                             "(e.g. 2020-03-03T01:45 local, or 2020-03-03T07:45Z UTC), then restore live radar")
+    parser.add_argument("--replay-frames", type=int, default=3, metavar="N",
+                        help="With --test-replay: number of radar frames to send (default 3, max 12)")
+    parser.add_argument("--replay-step", type=int, default=10, metavar="MIN",
+                        help="With --test-replay: minutes of real time between frames (default 10)")
+    parser.add_argument("--replay-gap", type=int, default=20, metavar="SEC",
+                        help="With --test-replay: seconds to wait between transmissions (default 20)")
     args = parser.parse_args()
 
     if args.setup:
         run_setup_wizard()
         return
+
+    if args.test_replay is not None:
+        hold = 120 if args.test_hold is None else args.test_hold
+        sys.exit(run_replay_test(args.test_replay, count=args.replay_frames, step_min=args.replay_step,
+                                 gap_sec=max(0, args.replay_gap), hold_sec=max(0, hold),
+                                 assume_yes=args.yes))
 
     if args.test_storm is not None:
         hold = 120 if args.test_hold is None else args.test_hold

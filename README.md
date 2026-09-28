@@ -192,6 +192,30 @@ channel**, so the command asks you to type `YES` first (add `--yes` to
 skip). Announce drills to your mesh users before running one. Press Ctrl+C
 during the hold to restore live radar immediately.
 
+The simulated storm is a textbook shape and a bit idealized: a real hook
+echo is only 1-3 miles wide, so on live radar it usually merges into one or
+two cells. For a true-to-life drill, use a real-event replay (below).
+
+### Real-event replay drill
+
+`--test-replay` rebroadcasts **real archived NEXRAD radar** from a past
+event (archive goes back to 2011), run through exactly the same pipeline as
+live data, so clients see what LoRadar actually would have shown. It sends 3
+frames 10 minutes of real time apart, 20 seconds apart on the air (clients
+can tap **Play** to loop them), holds 2 minutes, then restores live radar.
+
+```bash
+# March 3, 2020 Cookeville EF4 tornado (times without Z are this Pi's local time)
+python3 server.py --test-replay 2020-03-03T01:30
+python3 server.py --test-replay 2020-03-03T07:30Z             # same, in UTC
+python3 server.py --test-replay 2020-03-03T01:00 --replay-frames 6 --replay-step 10
+```
+
+Times are rounded down to the mosaic's 5-minute steps. The command lists
+each frame's cell count and peak dBZ before asking for `YES` (`--yes` skips
+it); if the peak reaches 55 dBZ it warns that client alarms will sound.
+Other options: `--replay-gap SEC` (air time between frames), `--test-hold SEC`.
+
 ### Packet formats
 
 - **`0xCF` Config Frame (12 bytes)**: station ID, center lat/lon (scaled
