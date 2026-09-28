@@ -38,20 +38,30 @@ sudo apt install -y git python3 python3-pip pipx
 python3 -m pipx ensurepath
 ```
 
-If your Pi says it cannot find the `pipx` package, use this fallback instead:
+If your Pi says it cannot find the `pipx` package, or you get an
+`error: externally-managed-environment` message from `pip`, use this fallback
+instead:
 
 ```bash
-sudo apt install -y git python3 python3-pip
-python3 -m pip install --user pipx
-python3 -m pipx ensurepath
+sudo apt install -y git python3 python3-pip python3-venv python3-full
+python3 -m venv ~/.venvs/meshcore-cli
+~/.venvs/meshcore-cli/bin/pip install meshcore-cli
 ```
 
-4. Close and reopen the terminal so `pipx` is on your `PATH`.
-5. Install [`meshcore-cli`](https://github.com/meshcore-dev/meshcore-cli):
+4. If you used `pipx`, close and reopen the terminal so `pipx` is on your
+   `PATH`.
+5. If you used `pipx`, install
+   [`meshcore-cli`](https://github.com/meshcore-dev/meshcore-cli):
 
 ```bash
 pipx install meshcore-cli
 ```
+
+If you used the virtual-environment fallback above, skip the `pipx install`
+step. During `python3 server.py --setup`, either activate that virtual
+environment first or enter
+`~/.venvs/meshcore-cli/bin/meshcore-cli` when LoRadar asks for the
+`meshcore-cli` executable path.
 
 6. Download this project and move into the folder:
 
