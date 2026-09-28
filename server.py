@@ -3,8 +3,9 @@
 Low-Bandwidth Off-Grid Weather Radar System — Backend Server
 ==============================================================
 
-Fetches NWS NEXRAD radar composite reflectivity data, downsamples it into a
-16x16 sparse dBZ matrix, packs it into compact binary frames (<=36 bytes), and
+Fetches live NWS NEXRAD base reflectivity (via the Iowa Environmental Mesonet
+nationwide mosaic), reduces it to a 16x16 dBZ grid using the strongest echo in
+each cell, packs it into compact binary frames (<=36 bytes), and
 dispatches those frames onto a user-chosen MeshCore channel via the stock
 `meshcore-cli` tool so they propagate across a LoRa mesh network to offline
 PWA clients.
@@ -208,78 +209,202 @@ import urllib.parse  # noqa: E402  (kept near usage above for clarity)
 # Radar data pipeline
 # ---------------------------------------------------------------------------
 
+# Real reflectivity comes from the Iowa Environmental Mesonet (IEM) NEXRAD
+# base-reflectivity mosaic (N0Q): a nationwide merge of every NWS NEXRAD
+# radar's Level III product, ~0.5 km pixels, refreshed every 5 minutes. IEM
+# serves it through a WMS that crops server-side to our exact box, so each
+# fetch is a few KB. Pixels are palette-coded; the palette is read from the
+# mosaic PNG itself and index -> dBZ is documented by IEM as
+# dBZ = index * 0.5 - 32.5 (index 0 = no data).
+IEM_WMS_URL = "https://mesonet.agron.iastate.edu/cgi-bin/wms/nexrad/n0q.cgi"
+IEM_N0Q_PNG = "https://mesonet.agron.iastate.edu/data/gis/images/4326/USCOMP/n0q_0.png"
+IEM_N0Q_META = "https://mesonet.agron.iastate.edu/data/gis/images/4326/USCOMP/n0q_0.json"
+N0Q_DEG_PER_PIXEL = 0.005
+RADAR_MAX_AGE_SEC = 20 * 60
+# A cell takes the strongest value covering at least this many source pixels
+# (~0.75 km^2), so tiny intense cores still show while single-pixel speckle
+# (clutter, birds, noise) is ignored.
+CELL_MIN_PIXELS = 3
+
+_n0q_color_to_dbz: Optional[dict] = None
+
+
+def _http_get_bytes(url: str, timeout: float = 30.0, headers: Optional[dict] = None) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": NWS_USER_AGENT, **(headers or {})})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def _png_chunks(data: bytes):
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError("not a PNG image")
+    i = 8
+    while i + 8 <= len(data):
+        (n,) = struct.unpack(">I", data[i:i + 4])
+        yield data[i + 4:i + 8], data[i + 8:i + 8 + n]
+        i += 12 + n
+
+
+def _decode_png_rgba(data: bytes) -> Tuple[int, int, List[bytearray]]:
+    """Minimal stdlib PNG decoder for the 8-bit RGB/RGBA images the IEM WMS
+    returns. Returns (width, height, rows) with each row as RGBA bytes."""
+    import zlib
+
+    width = height = color_type = 0
+    idat = bytearray()
+    for ctype, body in _png_chunks(data):
+        if ctype == b"IHDR":
+            width, height, depth, color_type, _, _, interlace = struct.unpack(">IIBBBBB", body)
+            if depth != 8 or color_type not in (2, 6) or interlace:
+                raise ValueError(f"unsupported PNG (depth={depth}, type={color_type}, interlace={interlace})")
+        elif ctype == b"IDAT":
+            idat += body
+        elif ctype == b"IEND":
+            break
+    raw = zlib.decompress(bytes(idat))
+    bpp = 4 if color_type == 6 else 3
+    stride = width * bpp
+    rows: List[bytearray] = []
+    prev = bytearray(stride)
+    pos = 0
+    for _ in range(height):
+        ftype = raw[pos]
+        line = bytearray(raw[pos + 1:pos + 1 + stride])
+        pos += 1 + stride
+        if ftype == 1:
+            for x in range(bpp, stride):
+                line[x] = (line[x] + line[x - bpp]) & 0xFF
+        elif ftype == 2:
+            for x in range(stride):
+                line[x] = (line[x] + prev[x]) & 0xFF
+        elif ftype == 3:
+            for x in range(stride):
+                left = line[x - bpp] if x >= bpp else 0
+                line[x] = (line[x] + ((left + prev[x]) >> 1)) & 0xFF
+        elif ftype == 4:
+            for x in range(stride):
+                a = line[x - bpp] if x >= bpp else 0
+                b = prev[x]
+                c = prev[x - bpp] if x >= bpp else 0
+                p = a + b - c
+                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                line[x] = (line[x] + (a if pa <= pb and pa <= pc else b if pb <= pc else c)) & 0xFF
+        prev = line
+        if bpp == 3:
+            rgba = bytearray(width * 4)
+            rgba[0::4], rgba[1::4], rgba[2::4] = line[0::3], line[1::3], line[2::3]
+            rgba[3::4] = b"\xff" * width
+            line = rgba
+        rows.append(line)
+    return width, height, rows
+
+
+def _load_n0q_palette() -> dict:
+    """Map RGB -> dBZ using the palette embedded in IEM's N0Q mosaic PNG.
+    Only the first few KB are downloaded (the palette precedes the pixels)."""
+    global _n0q_color_to_dbz
+    if _n0q_color_to_dbz is None:
+        head = _http_get_bytes(IEM_N0Q_PNG, headers={"Range": "bytes=0-8191"})
+        for ctype, body in _png_chunks(head):
+            if ctype == b"PLTE":
+                lut = {}
+                for idx in range(1, len(body) // 3):
+                    lut[bytes(body[idx * 3:idx * 3 + 3])] = idx * 0.5 - 32.5
+                _n0q_color_to_dbz = lut
+                break
+        else:
+            raise RuntimeError("N0Q palette not found in IEM mosaic header")
+    return _n0q_color_to_dbz
+
+
+def radar_data_age_sec() -> Optional[float]:
+    """Age of the current IEM mosaic in seconds, or None if unknown."""
+    from datetime import datetime, timezone
+
+    try:
+        meta = json.loads(_http_get_bytes(IEM_N0Q_META, timeout=15).decode("utf-8"))
+        valid = datetime.strptime(meta["meta"]["valid"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - valid).total_seconds()
+    except Exception:
+        return None
+
+
+def grid_geometry(cfg: Config) -> Tuple[float, float, float, float]:
+    """(center_lat, center_lon, deg_lat_per_cell, deg_lon_per_cell) exactly as
+    the PWA reconstructs them from the 0xCF config frame (center rounded to
+    0.01 deg, whole miles per cell), so server cells and drawn cells match."""
+    lat = round(cfg.center_lat, 2)
+    lon = round(cfg.center_lon, 2)
+    miles_per_cell = max(1, round(cfg.span_miles / GRID_SIZE))
+    return lat, lon, miles_per_cell / 69.0, miles_per_cell / (69.172 * math.cos(math.radians(lat)))
+
+
 def fetch_radar_reflectivity_grid(cfg: Config) -> List[List[Optional[float]]]:
-    """
-    Fetch the latest composite reflectivity for the configured station's
-    region and return a GRID_SIZE x GRID_SIZE array of dBZ floats (or None
-    for clean/no-data cells).
+    """Fetch live NEXRAD mosaic reflectivity for the coverage box and reduce
+    it to a GRID_SIZE x GRID_SIZE grid of dBZ (None = no echo >= DBZ_MIN).
+    Each cell takes the strongest reflectivity inside it (see
+    CELL_MIN_PIXELS). Raises on failure or stale data rather than reporting
+    a false all-clear."""
+    age = radar_data_age_sec()
+    if age is not None and age > RADAR_MAX_AGE_SEC:
+        raise RuntimeError(f"radar mosaic is stale ({age / 60:.0f} min old)")
 
-    NWS does not offer a simple pre-gridded raster API without pulling full
-    Level-III/Level-II radar products (large binary files, requires a
-    dedicated decoder such as Py-ART). To keep this a self-contained,
-    dependency-light script, we use the NWS "latest radar station alert /
-    tile" endpoint (ridge-style PNG) is avoided; instead we pull the
-    station's most recent observation-derived precipitation intensity via
-    the gridpoints API as a practical, low-bandwidth proxy, then fall back
-    to a synthetic-but-realistic decayed storm-cell model seeded from real
-    station location + current conditions when raw reflectivity rasters
-    are not reachable (e.g. offline dev/testing).
+    lut = _load_n0q_palette()
+    lat, lon, dlat, dlon = grid_geometry(cfg)
+    north, south = lat + GRID_SIZE / 2 * dlat, lat - GRID_SIZE / 2 * dlat
+    west, east = lon - GRID_SIZE / 2 * dlon, lon + GRID_SIZE / 2 * dlon
+    # Sample at the mosaic's native resolution, rounded up to whole pixels per cell.
+    px_per_cell_x = max(4, math.ceil(dlon / N0Q_DEG_PER_PIXEL))
+    px_per_cell_y = max(4, math.ceil(dlat / N0Q_DEG_PER_PIXEL))
+    width, height = px_per_cell_x * GRID_SIZE, px_per_cell_y * GRID_SIZE
 
-    If you have Py-ART / MetPy available and want true Level-II decoding,
-    replace `_get_reflectivity_source()` below with a real raster fetch and
-    keep the rest of the downsampling pipeline unchanged.
-    """
-    grid = _get_reflectivity_source(cfg)
+    url = (
+        f"{IEM_WMS_URL}?SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap&LAYERS=nexrad-n0q&STYLES="
+        f"&SRS=EPSG:4326&BBOX={west:.5f},{south:.5f},{east:.5f},{north:.5f}"
+        f"&WIDTH={width}&HEIGHT={height}&FORMAT=image/png&TRANSPARENT=TRUE"
+    )
+    data = _http_get_bytes(url, timeout=45)
+    if not data.startswith(b"\x89PNG"):
+        raise RuntimeError(f"radar WMS returned an error: {data[:200]!r}")
+    w, h, rows = _decode_png_rgba(data)
+    if (w, h) != (width, height):
+        raise RuntimeError(f"radar WMS returned {w}x{h}, expected {width}x{height}")
+
+    # Per cell, count pixels at each dBZ so we can pick the strongest value
+    # that's backed by at least CELL_MIN_PIXELS pixels.
+    hist: List[List[dict]] = [[{} for _ in range(GRID_SIZE)] for _ in range(GRID_SIZE)]
+    for py, row in enumerate(rows):
+        gy = py // px_per_cell_y
+        cells = hist[gy]
+        for px in range(width):
+            o = px * 4
+            if row[o + 3] == 0:
+                continue
+            dbz = lut.get(bytes(row[o:o + 3]))
+            if dbz is None or dbz < DBZ_MIN:
+                continue
+            counts = cells[px // px_per_cell_x]
+            counts[dbz] = counts.get(dbz, 0) + 1
+
+    grid: List[List[Optional[float]]] = [[None] * GRID_SIZE for _ in range(GRID_SIZE)]
+    for gy in range(GRID_SIZE):
+        for gx in range(GRID_SIZE):
+            running = 0
+            for dbz in sorted(hist[gy][gx], reverse=True):
+                running += hist[gy][gx][dbz]
+                if running >= CELL_MIN_PIXELS:
+                    grid[gy][gx] = dbz
+                    break
     return grid
 
 
-def _get_reflectivity_source(cfg: Config) -> List[List[Optional[float]]]:
-    """Attempt to build a real grid from NWS active alerts / observations as
-    a lightweight signal, otherwise produce an empty (clean) grid.
-
-    This function is intentionally isolated so it can be swapped for a true
-    NEXRAD Level-II/III raster decoder (e.g. Py-ART -> grid) in production
-    without touching the packet framing code below.
-    """
-    grid: List[List[Optional[float]]] = [[None for _ in range(GRID_SIZE)] for _ in range(GRID_SIZE)]
-
-    try:
-        # Use active severe weather alerts near the point as a coarse proxy
-        # for "is there a storm nearby" -> seed a plausible reflectivity
-        # blob. This keeps the demo functional without heavy geospatial
-        # dependencies, while real deployments should swap in Py-ART.
-        url = (
-            f"https://api.weather.gov/alerts/active?point={cfg.center_lat:.4f},{cfg.center_lon:.4f}"
-        )
-        data = http_get_json(url)
-        features = data.get("features", [])
-        if not features:
-            return grid  # clean grid, nothing active
-
-        # Seed a storm cell roughly in the middle of the grid with
-        # decaying intensity outward — deterministic, based on the number
-        # and severity of active alerts, so behavior is reproducible.
-        severity_boost = 0
-        for feat in features:
-            sev = feat.get("properties", {}).get("severity", "")
-            severity_boost += {"Extreme": 25, "Severe": 15, "Moderate": 8, "Minor": 3}.get(sev, 2)
-        severity_boost = min(severity_boost, 40)
-
-        cx, cy = GRID_SIZE // 2, GRID_SIZE // 2
-        peak = min(DBZ_MAX, DBZ_MIN + 20 + severity_boost)
-        radius = 5.5
-        for y in range(GRID_SIZE):
-            for x in range(GRID_SIZE):
-                d = math.hypot(x - cx, y - cy)
-                if d > radius:
-                    continue
-                val = peak - (d / radius) * (peak - DBZ_MIN)
-                if val >= DBZ_MIN:
-                    grid[y][x] = round(val)
-        return grid
-    except (urllib.error.URLError, TimeoutError, ValueError, KeyError):
-        # Network unavailable / API hiccup: return clean grid rather than crash.
-        return grid
+def fetch_alert_active(cfg: Config) -> bool:
+    """True if api.weather.gov has any active alert for the coverage center.
+    Drives the fast/slow update interval switch."""
+    data = http_get_json(
+        f"https://api.weather.gov/alerts/active?point={cfg.center_lat:.4f},{cfg.center_lon:.4f}"
+    )
+    return bool(data.get("features"))
 
 
 def downsample_to_sparse(grid: List[List[Optional[float]]]) -> List[Tuple[int, int]]:
@@ -756,12 +881,18 @@ def run_setup_wizard() -> None:
 # ---------------------------------------------------------------------------
 
 def build_frames_for_cycle(cfg: Config) -> Tuple[List[bytes], bool]:
-    """Return (frames, weather_active). weather_active is True when the grid
-    contains any echoes, i.e. an NWS alert is active for the location."""
+    """Return (frames, alert_active). alert_active is True when NWS has an
+    active alert for the location; it selects the fast update interval."""
     grid = fetch_radar_reflectivity_grid(cfg)
     sparse = downsample_to_sparse(grid)
     radar_frame = build_radar_frame(sparse)
-    return [radar_frame], bool(sparse)
+    try:
+        alert_active = fetch_alert_active(cfg)
+    except Exception as exc:
+        # Can't tell; stay fast if there are strong echoes nearby.
+        print(f"  ! NWS alert check failed ({exc})", file=sys.stderr)
+        alert_active = any(dbz >= 40 for _, dbz in sparse)
+    return [radar_frame], alert_active
 
 
 def run_loop(cfg: Config) -> None:
@@ -782,9 +913,9 @@ def run_loop(cfg: Config) -> None:
             frames = []
             # Re-broadcast the config frame periodically so late-joining
             # clients still receive station metadata.
-            if now - last_config_broadcast > max(fast * 10, 1800):
+            send_config = now - last_config_broadcast > max(fast * 10, 1800)
+            if send_config:
                 frames.append(config_frame)
-                last_config_broadcast = now
 
             radar_frames, active = build_frames_for_cycle(cfg)
             frames += radar_frames
@@ -795,6 +926,8 @@ def run_loop(cfg: Config) -> None:
             was_active = active
 
             dispatch_frames(cfg, frames)
+            if send_config:
+                last_config_broadcast = now
             print(f"[{time.strftime('%H:%M:%S')}] Sent {len(frames)} frame(s), "
                   f"radar payload {len(frames[-1])} bytes, next update in {interval}s")
         except Exception as exc:
@@ -833,11 +966,9 @@ def storm_grid_position(cfg: Config, lat: float, lon: float) -> Tuple[int, int, 
     """Map a lat/lon to (gx, gy) grid cell using the same geometry the PWA
     uses to draw cells, so the storm lands exactly on the named place.
     Also returns the distance in miles from the coverage center."""
-    miles_per_cell = max(1, round(cfg.span_miles / GRID_SIZE))
-    dx_miles = (lon - cfg.center_lon) * 69.172 * math.cos(math.radians(cfg.center_lat))
-    dy_miles = (lat - cfg.center_lat) * 69.0
-    gx = math.floor(GRID_SIZE / 2 + dx_miles / miles_per_cell)
-    gy = math.floor(GRID_SIZE / 2 - dy_miles / miles_per_cell)
+    c_lat, c_lon, dlat, dlon = grid_geometry(cfg)
+    gx = math.floor(GRID_SIZE / 2 + (lon - c_lon) / dlon)
+    gy = math.floor(GRID_SIZE / 2 - (lat - c_lat) / dlat)
     return gx, gy, haversine_miles(cfg.center_lat, cfg.center_lon, lat, lon)
 
 
@@ -949,20 +1080,27 @@ def run_self_test(hold_sec: int = 60, transmit: bool = True) -> int:
         return 1
 
     try:
-        http_get_json(f"https://api.weather.gov/alerts/active?point={cfg.center_lat:.4f},{cfg.center_lon:.4f}")
-        check("NWS api.weather.gov reachable", True)
+        alert = fetch_alert_active(cfg)
+        check("NWS alerts (api.weather.gov)", True, "alert ACTIVE" if alert else "no active alerts")
     except Exception as exc:
-        check("NWS api.weather.gov reachable", False, str(exc))
+        check("NWS alerts (api.weather.gov)", False, str(exc))
+
+    age = radar_data_age_sec()
+    if age is None:
+        check("Radar mosaic fresh", False, "could not read mosaic timestamp from IEM")
+    else:
+        check("Radar mosaic fresh", age <= RADAR_MAX_AGE_SEC, f"{age / 60:.0f} min old")
 
     try:
         sparse = downsample_to_sparse(fetch_radar_reflectivity_grid(cfg))
         frame = build_radar_frame(sparse)
-        check("Radar frame build", True,
-              f"{len(sparse)} active cell(s), {len(frame)} bytes"
-              + (" - weather alert active" if sparse else " - all clear"))
+        peak = f", peak {sparse[0][1]} dBZ" if sparse else ""
+        check("Live radar fetch + frame build", True,
+              f"{len(sparse)} cell(s) with echoes{peak}, {len(frame)} bytes"
+              + ("" if sparse else " - no precipitation in coverage"))
     except Exception as exc:
         sparse = []
-        check("Radar frame build", False, str(exc))
+        check("Live radar fetch + frame build", False, str(exc))
 
     cli = _cli_path(cfg)
     import shutil

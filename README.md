@@ -299,9 +299,31 @@ bridge) or an Android/desktop device for the companion connection.
 
 ## Notes on the radar data source
 
-`server.py`'s `_get_reflectivity_source()` is intentionally isolated: it
-currently derives a lightweight, deterministic reflectivity proxy from NWS
-active-alerts data (works with zero heavy dependencies). For true NEXRAD
-Level-II/III raster decoding, swap that function for a
-[Py-ART](https://arm-doe.github.io/pyart/)-based fetch + grid — the rest of
-the downsampling/framing/transport pipeline requires no changes.
+LoRadar uses **live NEXRAD radar**: the Iowa Environmental Mesonet (IEM)
+[N0Q base-reflectivity mosaic](https://mesonet.agron.iastate.edu/docs/nexrad_mosaic/),
+which merges every NWS NEXRAD radar's Level III data into one nationwide
+map (~0.5 km pixels, 0.5 dBZ steps, refreshed every 5 minutes). No API key
+or extra Python packages are needed.
+
+Each update cycle, `server.py`:
+
+1. Checks the mosaic timestamp and **refuses to send** if it is more than
+   20 minutes old, so a stale feed is never broadcast as "all clear".
+2. Downloads just your coverage box from IEM's WMS (a few KB PNG), decoded
+   with the Python standard library.
+3. Splits the box into the 16×16 grid and gives each cell the **strongest
+   reflectivity inside it** (not the average), so a small intense core
+   colors its whole cell. The value must cover at least 3 source pixels
+   (~0.75 km²) to filter out single-pixel noise and clutter.
+4. Sends the 16 strongest cells (the 36-byte frame limit). In widespread
+   rain, weaker cells beyond the top 16 are not shown.
+5. Separately checks `api.weather.gov` for active alerts at your location,
+   which only controls the fast/slow update interval.
+
+If the radar download fails, nothing is sent that cycle and the server
+retries at the fast interval. `python3 server.py --test` reports the
+mosaic's age and the live peak dBZ in your coverage area.
+
+Cell size is `round(box miles ÷ 16)` whole miles (e.g. 100 mi → 6 mi cells,
+so the grid actually spans 96 mi). The server uses exactly the same
+geometry the app uses to draw cells, so storms appear where they really are.
