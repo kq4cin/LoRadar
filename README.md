@@ -5,6 +5,8 @@ transmits it across a **stock MeshCore LoRa mesh network** (no custom
 firmware), and displays it on an offline-first PWA with cached map tiles and
 live GPS tracking.
 
+**Open the LoRadar PWA:** [kq4cin.github.io/LoRadar](https://kq4cin.github.io/LoRadar/)
+
 ## Project layout
 
 ```
