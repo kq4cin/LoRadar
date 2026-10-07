@@ -5,21 +5,6 @@ transmits it across a **stock MeshCore LoRa mesh network** (no custom
 firmware), and displays it on an offline-first PWA with cached map tiles and
 live GPS tracking.
 
-## About
-
-LoRadar uses three pieces to get local weather radar across a MeshCore network:
-
-- **Server:** Fetches NWS radar data, converts it to compact packets, and
-  broadcasts updates through a connected MeshCore node.
-- **Radio:** Stock MeshCore companion radios send and relay those packets
-  across the LoRa mesh.
-- **PWA app:** Connects to a companion radio, displays received radar on a map,
-  and provides GPS tracking and severe-weather alerts.
-
-The server and its connected radio provide the broadcast station; each person
-viewing radar needs the PWA and a companion radio connected to the same
-MeshCore channel.
-
 ## Project layout
 
 ```
@@ -277,20 +262,33 @@ PWA's setup wizard join/create the #channel for you (see below).
 
 ## 3. PWA Client
 
-Open the hosted [LoRadar PWA](https://kq4cin.github.io/LoRadar/). For local
-development, serve the `pwa/` folder over HTTPS (or `localhost` for
-dev/testing) — both WebBluetooth and WebSerial require a secure context. The
-app uses the official [`meshcore.js`](https://github.com/meshcore-dev/meshcore.js)
-library (loaded from a CDN at runtime, cached offline by the service worker) to
-speak the real MeshCore companion protocol — it does **not** treat the
-connection as a raw byte pipe, since stock firmware only understands its own
-structured command/response protocol.
+### Use the app on a phone or computer
+
+1. Open the hosted [LoRadar app](https://kq4cin.github.io/LoRadar/) in Chrome
+   or Edge. On Android, use Chrome for the radio connection.
+2. Turn on your MeshCore companion radio and make sure it has joined the same
+   channel as the LoRadar broadcast station.
+3. Follow the on-screen setup: connect to the radio, choose the channel, set
+   your location, and download map tiles while online.
+
+The app needs a secure connection to use Bluetooth or USB. The hosted link
+already provides this. The app connects using the official
+[`meshcore.js`](https://github.com/meshcore-dev/meshcore.js) library and
+MeshCore's companion protocol.
+
+### Run a local copy (development and testing)
+
+Use these steps if you are working on LoRadar or want to test a copy on your
+own computer. You do not need to do this to use the hosted app.
 
 ```bash
 cd LoRadar/pwa
 python -m http.server 8811
-# open http://localhost:8811/index.html in Chrome/Edge (desktop or Android)
 ```
+
+Then open <http://localhost:8811/index.html> in Chrome or Edge. `localhost`
+works for local testing; if you serve the app from another device or address,
+use HTTPS because Bluetooth and USB access require a secure connection.
 
 On first run you'll see the **onboarding wizard**:
 1. **Transport** — pick WebBluetooth or WebSerial; the app connects and
