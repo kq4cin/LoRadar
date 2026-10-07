@@ -5,7 +5,20 @@ transmits it across a **stock MeshCore LoRa mesh network** (no custom
 firmware), and displays it on an offline-first PWA with cached map tiles and
 live GPS tracking.
 
-**Open the LoRadar PWA:** [kq4cin.github.io/LoRadar](https://kq4cin.github.io/LoRadar/)
+## About
+
+LoRadar uses three pieces to get local weather radar across a MeshCore network:
+
+- **Server:** Fetches NWS radar data, converts it to compact packets, and
+  broadcasts updates through a connected MeshCore node.
+- **Radio:** Stock MeshCore companion radios send and relay those packets
+  across the LoRa mesh.
+- **PWA app:** Connects to a companion radio, displays received radar on a map,
+  and provides GPS tracking and severe-weather alerts.
+
+The server and its connected radio provide the broadcast station; each person
+viewing radar needs the PWA and a companion radio connected to the same
+MeshCore channel.
 
 ## Project layout
 
@@ -264,13 +277,14 @@ PWA's setup wizard join/create the #channel for you (see below).
 
 ## 3. PWA Client
 
-Serve the `pwa/` folder over HTTPS (or `localhost` for dev/testing) — both
-WebBluetooth and WebSerial require a secure context. The app uses the
-official [`meshcore.js`](https://github.com/meshcore-dev/meshcore.js)
-library (loaded from a CDN at runtime, cached offline by the service
-worker) to speak the real MeshCore companion protocol — it does **not**
-treat the connection as a raw byte pipe, since stock firmware only
-understands its own structured command/response protocol.
+Open the hosted [LoRadar PWA](https://kq4cin.github.io/LoRadar/). For local
+development, serve the `pwa/` folder over HTTPS (or `localhost` for
+dev/testing) — both WebBluetooth and WebSerial require a secure context. The
+app uses the official [`meshcore.js`](https://github.com/meshcore-dev/meshcore.js)
+library (loaded from a CDN at runtime, cached offline by the service worker) to
+speak the real MeshCore companion protocol — it does **not** treat the
+connection as a raw byte pipe, since stock firmware only understands its own
+structured command/response protocol.
 
 ```bash
 cd LoRadar/pwa
