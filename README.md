@@ -363,7 +363,12 @@ Each update cycle, `server.py`:
 4. Sends the 16 strongest cells (the 36-byte frame limit). In widespread
    rain, weaker cells beyond the top 16 are not shown.
 5. Separately checks `api.weather.gov` for active alerts at your location,
-   which only controls the fast/slow update interval.
+   which only controls the fast/slow update interval. **Dense Fog Advisory**
+   and **Freezing Fog Advisory** do not trigger faster updates: fog-only
+   conditions use the slow interval, while any other active alert still
+   triggers the fast interval, even alongside a fog advisory. If the NWS
+   alert check fails, the existing fallback uses the fast interval when
+   transmitted radar cells have reflectivity of at least 40 dBZ.
 
 If the radar download fails, nothing is sent that cycle and the server
 retries at the fast interval. `python3 server.py --test` reports the

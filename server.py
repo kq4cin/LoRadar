@@ -87,9 +87,9 @@ class Config:
     center_lat: float = 0.0
     center_lon: float = 0.0
     span_miles: float = 50.0
-    # Fast interval, used while an NWS alert is active for the location.
+    # Fast interval, used while a non-fog NWS alert is active for the location.
     update_interval_sec: int = 300
-    # Slow interval, used when no alerts are active (quiet weather).
+    # Slow interval, used when no non-fog alerts are active (quiet weather).
     idle_interval_sec: int = 1800
 
     # How `meshcore-cli` should connect to the local companion-radio node.
@@ -408,12 +408,16 @@ def fetch_radar_reflectivity_grid(cfg: Config, when=None) -> List[List[Optional[
 
 
 def fetch_alert_active(cfg: Config) -> bool:
-    """True if api.weather.gov has any active alert for the coverage center.
+    """True if api.weather.gov has an active non-fog alert for the coverage center.
     Drives the fast/slow update interval switch."""
     data = http_get_json(
         f"https://api.weather.gov/alerts/active?point={cfg.center_lat:.4f},{cfg.center_lon:.4f}"
     )
-    return bool(data.get("features"))
+    ignored_events = {"Dense Fog Advisory", "Freezing Fog Advisory"}
+    return any(
+        (feature.get("properties") or {}).get("event") not in ignored_events
+        for feature in data.get("features") or []
+    )
 
 
 def downsample_to_sparse(grid: List[List[Optional[float]]]) -> List[Tuple[int, int]]:
@@ -749,8 +753,8 @@ def run_setup_wizard() -> None:
 
     span_miles = float(prompt("Regional bounding box size in miles", str(cfg.span_miles or 50)))
     print("\n  Updates run on two speeds to save mesh airtime:")
-    print("    - Fast interval while an NWS alert is active for your location")
-    print("    - Slow interval when the weather is quiet (no active alerts)")
+    print("    - Fast interval while a non-fog NWS alert is active for your location")
+    print("    - Slow interval when no alerts other than fog advisories are active")
     update_interval = int(prompt("Fast update interval during alerts (seconds)", str(cfg.update_interval_sec or 300)))
     idle_interval = int(prompt("Slow update interval when quiet (seconds)", str(cfg.idle_interval_sec or 1800)))
     if idle_interval < update_interval:
@@ -891,7 +895,7 @@ def run_setup_wizard() -> None:
 
 def build_frames_for_cycle(cfg: Config) -> Tuple[List[bytes], bool]:
     """Return (frames, alert_active). alert_active is True when NWS has an
-    active alert for the location; it selects the fast update interval."""
+    active non-fog alert for the location; it selects the fast update interval."""
     grid = fetch_radar_reflectivity_grid(cfg)
     sparse = downsample_to_sparse(grid)
     radar_frame = build_radar_frame(sparse)
@@ -1198,7 +1202,7 @@ def run_self_test(hold_sec: int = 60, transmit: bool = True) -> int:
 
     try:
         alert = fetch_alert_active(cfg)
-        check("NWS alerts (api.weather.gov)", True, "alert ACTIVE" if alert else "no active alerts")
+        check("NWS alerts (api.weather.gov)", True, "alert ACTIVE" if alert else "no active non-fog alerts")
     except Exception as exc:
         check("NWS alerts (api.weather.gov)", False, str(exc))
 
